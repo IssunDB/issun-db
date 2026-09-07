@@ -60,7 +60,7 @@ impl Graph {
     /// error, since a traversal from a node that is not there has reached nothing.
     pub fn bfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
         self.with_snapshot(|snap| {
-            let Some(&start_dense) = snap.id_to_dense.get(&start) else {
+            let Some(start_dense) = snap.id_to_dense.get(&start) else {
                 return Ok(vec![]);
             };
             let mut levels = vec![UNREACHED; snap.dense_to_id.len()];
@@ -106,7 +106,7 @@ impl Graph {
             let mut truncated = false;
             let mut visited = 0usize;
             for &seed in seeds {
-                let Some(&dense) = snap.id_to_dense.get(&seed) else {
+                let Some(dense) = snap.id_to_dense.get(&seed) else {
                     continue;
                 };
                 if levels[dense as usize] != UNREACHED {
@@ -217,29 +217,29 @@ impl Graph {
 
         self.ensure_snapshot_fresh()?;
         let snap = self.csr_cache.snapshot.load();
-        let (row_ptr, col_idx, edge_type, edge_id) = if is_incoming {
-            (
-                &snap.in_row_ptr,
-                &snap.in_col_idx,
-                &snap.in_edge_type,
-                &snap.in_edge_id,
-            )
+        let (row_ptr, col_idx) = if is_incoming {
+            (&snap.in_row_ptr, &snap.in_col_idx)
         } else {
-            (&snap.row_ptr, &snap.col_idx, &snap.edge_type, &snap.edge_id)
+            (&snap.row_ptr, &snap.col_idx)
+        };
+        // An incoming entry's type and id live at its outgoing position.
+        let pos = |k: usize| {
+            if is_incoming {
+                snap.in_pos[k] as usize
+            } else {
+                k
+            }
         };
         let mut results = Vec::new();
         for &src in src_nodes {
             let d = match snap.id_to_dense.get(&src) {
-                Some(&d) => d as usize,
+                Some(d) => d as usize,
                 None => continue,
             };
             for k in row_ptr[d]..row_ptr[d + 1] {
-                if let Some(tid) = type_id {
-                    if edge_type[k] == tid {
-                        results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
-                    }
-                } else {
-                    results.push((src, edge_id[k], snap.dense_to_id[col_idx[k] as usize]));
+                let p = pos(k);
+                if type_id.is_none_or(|tid| snap.edge_type[p] == tid) {
+                    results.push((src, snap.edge_id[p], snap.dense_to_id[col_idx[k] as usize]));
                 }
             }
         }

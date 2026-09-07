@@ -19,7 +19,16 @@ fn index_role_name(flags: u8) -> &'static str {
 pub(crate) struct LabelScanCache {
     generation: u64,
     by_label: AHashMap<String, std::sync::Arc<Vec<NodeId>>>,
+    /// One bit per node id, derived from the scan above, for bulk membership
+    /// tests.
+    bitmaps: AHashMap<String, std::sync::Arc<Vec<u64>>>,
 }
+
+/// Requests of at least this many candidates test label membership through
+/// the cached per-id bitmap rather than one `label_idx` lookup each. Below it
+/// the point lookups are cheaper than a label scan the bitmap may have to
+/// trigger.
+const LABEL_FILTER_BITMAP_MIN: usize = 1024;
 
 impl Graph {
     // ------------------------------------------------------------------
@@ -47,6 +56,7 @@ impl Graph {
         let generation = self.csr_cache.current_gen();
         if cache.generation != generation {
             cache.by_label.clear();
+            cache.bitmaps.clear();
             cache.generation = generation;
         }
         if let Some(hit) = cache.by_label.get(label) {
@@ -95,23 +105,67 @@ impl Graph {
     /// with the candidate set rather than the label population.
     #[doc(hidden)]
     pub fn label_filter(&self, nodes: &[NodeId], label: &str) -> Result<Vec<NodeId>, Error> {
+        let keep = self.nodes_have_label(nodes, label)?;
+        Ok(nodes
+            .iter()
+            .zip(keep)
+            .filter_map(|(&n, k)| k.then_some(n))
+            .collect())
+    }
+
+    /// Whether each of `nodes` carries `label`, in input order. A request of
+    /// `LABEL_FILTER_BITMAP_MIN` or more candidates reads the cached per-id
+    /// bitmap of the label (built once per write generation from the label
+    /// scan), the rest are one `label_idx` point lookup per candidate. Sorting
+    /// two million candidates and looking each up cost more than the whole
+    /// four-hop query they were filtering.
+    pub fn nodes_have_label(&self, nodes: &[NodeId], label: &str) -> Result<Vec<bool>, Error> {
+        if nodes.len() >= LABEL_FILTER_BITMAP_MIN {
+            let bits = self.label_bitmap_arc(label)?;
+            return Ok(nodes
+                .iter()
+                .map(|&n| {
+                    bits.get((n / 64) as usize)
+                        .is_some_and(|w| (w >> (n % 64)) & 1 == 1)
+                })
+                .collect());
+        }
         let rtxn = self.storage.env.read_txn()?;
         let label_id = match get_label(&self.storage, &rtxn, label)? {
             Some(id) => id,
-            None => return Ok(vec![]),
+            None => return Ok(vec![false; nodes.len()]),
         };
-        let mut out = Vec::new();
-        for &n in nodes {
-            if self
-                .storage
-                .label_idx
-                .get(&rtxn, &composite_key(label_id, n))?
-                .is_some()
-            {
-                out.push(n);
-            }
+        nodes
+            .iter()
+            .map(|&n| {
+                Ok(self
+                    .storage
+                    .label_idx
+                    .get(&rtxn, &composite_key(label_id, n))?
+                    .is_some())
+            })
+            .collect()
+    }
+
+    /// The label's membership as one bit per node id, cached per write
+    /// generation beside the label scan it is derived from.
+    fn label_bitmap_arc(&self, label: &str) -> Result<std::sync::Arc<Vec<u64>>, Error> {
+        let members = self.nodes_by_label_arc(label)?;
+        let mut cache = self.label_scans.lock();
+        // `nodes_by_label_arc` has just aligned the cache to the current
+        // generation, so an entry found here belongs to the same generation
+        // as `members`.
+        if let Some(hit) = cache.bitmaps.get(label) {
+            return Ok(hit.clone());
         }
-        Ok(out)
+        let words = members.last().map_or(0, |&max| (max / 64) as usize + 1);
+        let mut bits = vec![0u64; words];
+        for &id in members.iter() {
+            bits[(id / 64) as usize] |= 1u64 << (id % 64);
+        }
+        let bits = std::sync::Arc::new(bits);
+        cache.bitmaps.insert(label.to_string(), bits.clone());
+        Ok(bits)
     }
 
     /// Returns all edge IDs with the given type, in ascending ID order.
@@ -2611,6 +2665,49 @@ mod label_filter_tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    /// A request at or above the bitmap threshold reads the cached per-id
+    /// bitmap and must agree with the point lookups a small request makes,
+    /// including for ids past the label's last member, unknown labels, and a
+    /// write that moves the generation.
+    #[test]
+    fn bulk_label_membership_agrees_with_point_lookups() {
+        let (_dir, g) = open_tmp();
+        let mut ids = Vec::new();
+        for i in 0..1500u64 {
+            let label = if i % 3 == 0 { "Person" } else { "Other" };
+            ids.push(g.add_node(label, &json!({ "i": i })).unwrap());
+        }
+        ids.push(ids.last().unwrap() + 1000);
+        let bulk = g.nodes_have_label(&ids, "Person").unwrap();
+        let point: Vec<bool> = ids
+            .iter()
+            .map(|&id| {
+                !g.nodes_have_label(&[id], "Person").unwrap().is_empty()
+                    && g.nodes_have_label(&[id], "Person").unwrap()[0]
+            })
+            .collect();
+        assert_eq!(bulk, point);
+        assert_eq!(bulk.iter().filter(|&&k| k).count(), 500);
+        assert_eq!(
+            g.label_filter(&ids, "Person").unwrap(),
+            ids.iter()
+                .copied()
+                .filter(|id| id % 3 == 0 && *id < 1500)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            g.nodes_have_label(&ids, "Ghost")
+                .unwrap()
+                .iter()
+                .all(|k| !k)
+        );
+
+        g.add_label(ids[1], "Person").unwrap();
+        let after = g.nodes_have_label(&ids, "Person").unwrap();
+        assert!(after[1], "a committed write refreshes the bitmap");
+        assert_eq!(after.iter().filter(|&&k| k).count(), 501);
     }
 
     #[test]

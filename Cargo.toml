@@ -8,7 +8,7 @@ exclude = ["benchmarks/ladybugdb-compare"]
 
 
 [workspace.package]
-version = "0.1.0-alpha.28"
+version = "0.1.0-alpha.29"
 edition = "2024"
 authors = ["Hassan Abedi <hassan.abedi.t+issundb@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -18,13 +18,14 @@ rust-version = "1.85.0"
 
 
 [workspace.dependencies]
-issundb = { path = "crates/issundb", version = "0.1.0-alpha.28", default-features = false }
-issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.28", default-features = false }
-issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.28", default-features = false }
-issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.28", default-features = false }
-issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.28", default-features = false }
-issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.28", default-features = false }
+issundb = { path = "crates/issundb", version = "0.1.0-alpha.29", default-features = false }
+issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.29", default-features = false }
+issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.29", default-features = false }
+issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.29", default-features = false }
+issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.29", default-features = false }
+issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.29", default-features = false }
 heed = "0.22"
+memmap2 = "0.9"
 colored = "3.1.1"
 byteorder = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }

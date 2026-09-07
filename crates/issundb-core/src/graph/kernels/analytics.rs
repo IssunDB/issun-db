@@ -1147,7 +1147,7 @@ impl Graph {
         b: NodeId,
         metric: LinkPredictionMetric,
     ) -> f64 {
-        let (Some(&da), Some(&db)) = (snap.id_to_dense.get(&a), snap.id_to_dense.get(&b)) else {
+        let (Some(da), Some(db)) = (snap.id_to_dense.get(&a), snap.id_to_dense.get(&b)) else {
             return 0.0;
         };
 

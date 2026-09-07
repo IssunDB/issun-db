@@ -1,3 +1,4 @@
+pub(crate) mod array;
 #[cfg(feature = "lmdb")]
 pub(crate) mod cache_file;
 pub(crate) mod columns;

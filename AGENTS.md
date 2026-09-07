@@ -55,38 +55,18 @@ Priorities, in order:
 An entry says what a module owns and where a new thing belongs. How a module works lives in the crate's own `AGENTS.md`, named at the end of this
 section, and a public method's contract lives under Component APIs. Do not invent modules that do not yet exist; place new modules according to this map.
 
-- `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types.
+- `crates/issundb-core/`: storage engine. Public surface is `Graph` and the schema types; the source tree is the module map. Only the files below carry a
+  rule the module name does not show.
     - `src/bin/gen_testdata.rs`: the `gen_testdata` binary that regenerates the versioned LMDB storage-format snapshot (`make testdata`).
-    - `src/schema.rs`: `NodeId`, `EdgeId`, `LabelId`, `TypeId`, `AdjEntry`, `NodeRecord`, `EdgeRecord`, and `TableStat`. A node carries zero or more
-      labels; use `primary_label` and `has_label` to inspect them.
-    - `src/storage/lmdb.rs`: the LMDB `Storage`; `src/storage/memory.rs`: the in-memory backend, second implementor of the contract in
-      `storage/mod.rs`, which the whole suite also runs against. `src/storage/ids.rs`: monotonic ID allocation and the label and type registries in
-      `meta`. `src/storage/props.rs`: msgpack helpers. `src/storage/fts.rs`: full-text postings and document tables.
-    - `src/graph/mod.rs`: `Graph`, `ReadTxn`, `WriteTxn` definitions and lifecycle methods (`open`, `view`, `update`, `backup`, `restore`,
-      `rebuild_csr`). `src/graph/node.rs` and `src/graph/edge.rs`: node and edge CRUD and adjacency. `src/graph/index.rs`: the label index, property
-      indexes, constraints, and property scans. `src/graph/txn.rs`: `ReadTxn` and `WriteTxn` delegation and transaction tests.
-    - `src/graph/stats.rs`: cardinality statistics and the data-graph schema for the optimizer (crate guide, "Schema Statistics").
-    - `src/graph/fts_mod.rs`: full-text index lifecycle. `src/graph/vector.rs`: vector byte storage.
-    - `src/graph/algo.rs`: public algorithm dispatch and the snapshot freshness gate. `src/graph/kernels/`: the algorithm implementations over the
-      CSR snapshot, split into `traversal.rs`, `analytics.rs`, `paths.rs`, and `flow.rs` (crate guide, "Algorithm Kernels").
-    - `src/csr.rs`: the CSR snapshot, its incoming view, the `GraphDelta` write buffer, the `CsrChange` records the incremental refresh applies, and
-      the generation counters (crate guide, "CSR Snapshot Vs. LMDB Adjacency").
-    - `src/columns.rs`: in-memory typed property columns and per-property statistics (crate guide, "In-memory Property Columns"). `src/histogram.rs`:
-      the equi-depth histogram behind the selectivity estimates; nothing here is persisted.
-    - `src/threads.rs`: the one resolution of the thread budget every parallel consumer shares (crate guide, "Thread Count").
+    - `src/array.rs`: `Array<T>`, the owned-or-mapped array behind the CSR snapshot and the property columns. Mutate one only through `with_mut`,
+      which copies a mapped view onto the heap; a mapped cache file is never written through.
     - `src/cache_file.rs`: the on-disk cache files for the CSR snapshot and the property columns (`lmdb` feature only), keyed by database identity and
-      commit generation and refused on any mismatch. The only save sites are `Graph::rebuild_csr` and the `materialize_*_columns` methods; no lazy
+      commit generation, refused on any mismatch, and memory-mapped rather than read on load. The only save sites are `Graph::rebuild_csr` and the `materialize_*_columns` methods; no lazy
       build writes a file as a side effect of a query.
-    - `src/error.rs`: the `Error` enum; `Error::Storage` carries the selected backend's error type.
-- `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor.
-    - `src/parser.rs`: the `chumsky` parser with a Pratt expression parser, the parse cache, and compiler-style diagnostics (crate guide, "Parser
-      Structure Rules" and "Parse Diagnostics"). `src/ast.rs`: AST types. `src/plan/`: planners, optimizer, and statistics helpers.
+- `crates/issundb-cypher/`: Cypher parser, AST, logical planner, physical planner, optimizer, and executor. Only the files below carry a rule the
+  module name does not show.
     - `src/procedure.rs`: the `ProcedureRegistry` for `query_with_procedures`. `src/builtin_procs.rs`: the built-in `issundb.*` procedures, resolved
       against a `CALL` clause before planning; path algorithms other than `shortestPath` and `dijkstra` are deliberately excluded.
-    - `src/exec/mod.rs`: entry points (`execute`, `explain`) and shared types. `src/exec/read.rs`: `execute_physical`, the read-path helpers, and the
-      plan cache. `src/exec/vectorized.rs`: the columnar fast path (crate guide, "Vectorized Aggregate and Columnar Fast Path").
-      `src/exec/factorize.rs`: `FactorizedRecordGroup`. `src/exec/expr.rs`: expression evaluation. `src/exec/write.rs`: mutation execution.
-      `src/exec/row.rs`: `SlotRow` and `SlotSchema`.
     - `src/exec/ddl.rs`: DDL execution. A node `CREATE INDEX` provisions the full-text index, because node property lookups are served by the
       always-on auto-index; a relationship `CREATE INDEX` provisions the property index.
     - `src/exec/copy.rs`: `COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`. An import streams rows into one transaction as they decode; do
@@ -145,7 +125,9 @@ section, and a public method's contract lives under Component APIs. Do not inven
 ## Architecture Constraints
 
 - Adjacency is stored as LMDB `DUPSORT + DUPFIXED`: each duplicate value under a node key is one raw `AdjEntry` (20 bytes). A single `db.put` appends
-  one entry in O(log n); there is no read-modify-write of a blob.
+  one entry in O(log n); there is no read-modify-write of a blob. A bulk load (`WriteTxn::begin_bulk_load`, which `COPY` and `IMPORT DATABASE`
+  turn on) buffers the entries and writes them sorted by node id, because one random put per edge dirties a B-tree page per edge; reads inside that
+  transaction merge the buffer, so results do not change.
 - The label index (`label_idx`) uses 12-byte composite keys `(u32 BE, u64 BE)` with `Unit` values, so a prefix scan enumerates a label's nodes in
   ascending ID order. A multi-label node has one entry per label. There is no edge type index: `edges_by_type` is one filtered pass over `edges`, which
   iterates in ascending edge id, per-type counts come from the `stats:t:` counters, and the counting kernels and the Cypher executor read the CSR
@@ -277,7 +259,9 @@ Read-path and statistics methods:
 - `plan_generation() -> (u64, u64, u64)`: what a cached query plan is valid for: a per-open identity nonce, the committed write generation, and a
   schema generation that index and constraint DDL and the `materialize_*` builders advance. Those changes alter plans without being data writes, and
   they do not advance the write generation because that would mark the CSR snapshot stale for nothing.
-- `label_filter(nodes, label)`: the subset of `nodes` carrying `label`, one `label_idx` point lookup per candidate.
+- `label_filter(nodes, label)` and `nodes_have_label(nodes, label)`: the subset of `nodes` carrying `label`, and the per-candidate answer. A request
+  of `LABEL_FILTER_BITMAP_MIN` or more candidates reads a per-id bitmap cached per write generation beside the label scan; smaller ones are one
+  `label_idx` point lookup each.
 - `nodes_by_label_arc(label)`: `nodes_by_label` without the copy, served from a per-generation cache that any committed write discards;
   transaction-scoped label reads bypass it, because an open write transaction must see its own uncommitted labels.
 - `nodes_prop_cmp_mask(ids, prop, op, rhs) -> Result<Option<Vec<bool>>, Error>`: the per-id outcome of `prop <op> rhs` against the typed column, with

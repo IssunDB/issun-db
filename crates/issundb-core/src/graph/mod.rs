@@ -22,9 +22,9 @@ use crate::{
     storage::{
         Storage, fts,
         ids::{
-            adjust_label_count, adjust_type_count, alloc_edge_id, alloc_node_id, get_label,
-            get_or_create_label, get_or_create_prop_key, get_or_create_type, get_prop_key,
-            get_prop_key_name, get_type,
+            KEY_NEXT_EDGE, KEY_NEXT_NODE, adjust_label_count, adjust_type_count, alloc_edge_id,
+            alloc_node_id, get_label, get_or_create_label, get_or_create_prop_key,
+            get_or_create_type, get_prop_key, get_prop_key_name, get_type,
         },
         props,
     },
@@ -632,11 +632,37 @@ pub struct WriteTxn<'a> {
 /// here too. The endpoint memo is the one that can go stale from inside, since a
 /// node deleted later in the same transaction must stop counting as present, so
 /// a delete clears it.
+/// Buffered adjacency entries per direction before a bulk-load transaction
+/// writes them sorted: 4M entries, about 110 MB per direction.
+const ADJ_FLUSH_THRESHOLD: usize = 1 << 22;
+
 #[derive(Default)]
 pub(super) struct WriteBatchCache {
     /// Relationship type name to id, including types created by this
     /// transaction.
     types: AHashMap<String, TypeId>,
+    /// The next node and edge ids to hand out, once read from `meta`. Every
+    /// allocation inside a `WriteTxn` goes through these, and the values are
+    /// written back once at commit, where allocating straight from `meta` cost
+    /// a read and a write of the counter per record: with the per-label and
+    /// per-type counts below, a sixth of a bulk load's time at 200k persons.
+    next_node: Option<NodeId>,
+    next_edge: Option<EdgeId>,
+    /// Pending changes to the `stats:l:` and `stats:t:` counters, applied to
+    /// the stored values at commit.
+    label_deltas: AHashMap<LabelId, i64>,
+    type_deltas: AHashMap<TypeId, i64>,
+    /// Bulk-load mode (`WriteTxn::begin_bulk_load`): adjacency entries are
+    /// buffered here and written sorted by node id, in chunks of
+    /// [`ADJ_FLUSH_THRESHOLD`] and at commit, instead of one random `put` per
+    /// edge. A random put into `in_adj` dirties one B-tree leaf per edge, and
+    /// on a multi-million-edge load the dirty set outgrows what LMDB keeps in
+    /// memory for one transaction; sorted puts touch each leaf once per chunk.
+    /// Measured at 2M persons the per-edge cost had grown 3.4x over 200k
+    /// persons from this alone.
+    bulk: bool,
+    pending_out: Vec<(NodeId, AdjEntry)>,
+    pending_in: Vec<(NodeId, AdjEntry)>,
     /// Active edge property indexes per type, as `get_active_edge_indexes`
     /// returns them.
     edge_indexes: AHashMap<TypeId, Vec<(PropKeyId, u8)>>,
@@ -683,6 +709,165 @@ impl WriteBatchCache {
     /// interleaves deletions re-proves each endpoint against storage.
     pub(super) fn invalidate_nodes(&mut self) {
         self.known_nodes.clear();
+    }
+
+    /// The next node id, reading the stored counter on the first call.
+    pub(super) fn alloc_node_id(
+        &mut self,
+        storage: &Storage,
+        wtxn: &mut crate::storage::RwTxn,
+    ) -> Result<NodeId, Error> {
+        let next = match self.next_node {
+            Some(n) => n,
+            None => crate::storage::ids::read_counter(storage, wtxn, KEY_NEXT_NODE)?,
+        };
+        self.next_node = Some(next + 1);
+        Ok(next)
+    }
+
+    /// The next edge id, reading the stored counter on the first call.
+    pub(super) fn alloc_edge_id(
+        &mut self,
+        storage: &Storage,
+        wtxn: &mut crate::storage::RwTxn,
+    ) -> Result<EdgeId, Error> {
+        let next = match self.next_edge {
+            Some(n) => n,
+            None => crate::storage::ids::read_counter(storage, wtxn, KEY_NEXT_EDGE)?,
+        };
+        self.next_edge = Some(next + 1);
+        Ok(next)
+    }
+
+    pub(super) fn bump_label_count(&mut self, label_id: LabelId, delta: i64) {
+        *self.label_deltas.entry(label_id).or_insert(0) += delta;
+    }
+
+    pub(super) fn bump_type_count(&mut self, type_id: TypeId, delta: i64) {
+        *self.type_deltas.entry(type_id).or_insert(0) += delta;
+    }
+
+    /// The pending, unflushed change to a label's count.
+    pub(super) fn label_count_delta(&self, label_id: LabelId) -> i64 {
+        self.label_deltas.get(&label_id).copied().unwrap_or(0)
+    }
+
+    /// The pending, unflushed change to a type's count.
+    pub(super) fn type_count_delta(&self, type_id: TypeId) -> i64 {
+        self.type_deltas.get(&type_id).copied().unwrap_or(0)
+    }
+
+    pub(super) fn is_bulk(&self) -> bool {
+        self.bulk
+    }
+
+    pub(super) fn begin_bulk(&mut self) {
+        self.bulk = true;
+    }
+
+    /// Buffer both adjacency entries of a new edge, flushing the buffers
+    /// sorted once they reach the chunk size.
+    pub(super) fn defer_adj(
+        &mut self,
+        storage: &Storage,
+        wtxn: &mut crate::storage::RwTxn,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: TypeId,
+        edge_id: EdgeId,
+    ) -> Result<(), Error> {
+        self.pending_out.push((
+            src,
+            AdjEntry {
+                edge_type,
+                other: dst,
+                edge_id,
+            },
+        ));
+        self.pending_in.push((
+            dst,
+            AdjEntry {
+                edge_type,
+                other: src,
+                edge_id,
+            },
+        ));
+        if self.pending_out.len() >= ADJ_FLUSH_THRESHOLD {
+            self.flush_adjacency(storage, wtxn)?;
+        }
+        Ok(())
+    }
+
+    /// Whether any adjacency entry is still buffered.
+    pub(super) fn has_pending_adjacency(&self) -> bool {
+        !self.pending_out.is_empty()
+    }
+
+    /// The buffered entries of one node in one direction, for a read that
+    /// happens inside a bulk-load transaction.
+    pub(super) fn pending_adj_of(&self, node: NodeId, outgoing: bool) -> Vec<AdjEntry> {
+        let pending = if outgoing {
+            &self.pending_out
+        } else {
+            &self.pending_in
+        };
+        pending
+            .iter()
+            .filter(|(n, _)| *n == node)
+            .map(|(_, e)| *e)
+            .collect()
+    }
+
+    /// Write the buffered adjacency entries, each direction sorted by node id
+    /// and then by the store's duplicate order, through one cursor per
+    /// direction (`storage::put_sorted_duplicates`), so consecutive entries
+    /// land on the same B-tree page without a descent from the root each.
+    pub(super) fn flush_adjacency(
+        &mut self,
+        storage: &Storage,
+        wtxn: &mut crate::storage::RwTxn,
+    ) -> Result<(), Error> {
+        for (pending, db) in [
+            (&mut self.pending_out, &storage.out_adj),
+            (&mut self.pending_in, &storage.in_adj),
+        ] {
+            pending.sort_unstable_by(|(a, ea), (b, eb)| {
+                a.cmp(b).then_with(|| ea.as_bytes().cmp(eb.as_bytes()))
+            });
+            let entries: Vec<(NodeId, &[u8])> =
+                pending.iter().map(|(n, e)| (*n, e.as_bytes())).collect();
+            crate::storage::put_sorted_duplicates(db, wtxn, &entries)?;
+            pending.clear();
+        }
+        Ok(())
+    }
+
+    /// Write the batched counters to `meta`, ahead of the commit. The count
+    /// deltas are added to the stored values, so a path in the same
+    /// transaction that adjusted a counter directly (a deletion) is not
+    /// overwritten.
+    pub(super) fn flush_counters(
+        &mut self,
+        storage: &Storage,
+        wtxn: &mut crate::storage::RwTxn,
+    ) -> Result<(), Error> {
+        if let Some(next) = self.next_node.take() {
+            crate::storage::ids::write_counter(storage, wtxn, KEY_NEXT_NODE, next)?;
+        }
+        if let Some(next) = self.next_edge.take() {
+            crate::storage::ids::write_counter(storage, wtxn, KEY_NEXT_EDGE, next)?;
+        }
+        for (label_id, delta) in std::mem::take(&mut self.label_deltas) {
+            if delta != 0 {
+                adjust_label_count(storage, wtxn, label_id, delta)?;
+            }
+        }
+        for (type_id, delta) in std::mem::take(&mut self.type_deltas) {
+            if delta != 0 {
+                adjust_type_count(storage, wtxn, type_id, delta)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -755,6 +940,8 @@ impl Graph {
         // Older versions persisted the CSR snapshot next to the LMDB files but
         // never read it back; remove the stale artifact if one is present.
         let _ = std::fs::remove_file(path.join("csr_snapshot.bin"));
+        #[cfg(feature = "lmdb")]
+        crate::cache_file::remove_set_aside_files(path);
         let storage = Arc::new(storage);
         // Opening builds nothing. The CSR snapshot is built by the freshness gate
         // (`ensure_snapshot_fresh`) when a consumer that needs it first runs, and
@@ -854,7 +1041,7 @@ impl Graph {
             ));
         }
         self.prop_columns.with_fresh(&self.storage, |cols| {
-            cols.id_to_dense.get(&id).map(|&d| {
+            cols.id_to_dense.get(&id).map(|d| {
                 cols.cols
                     .get(prop)
                     .and_then(|c| c.get_json_opt(d as usize))
@@ -961,7 +1148,7 @@ impl Graph {
         self.prop_columns.with_fresh(&self.storage, |cols| {
             ids.iter()
                 .map(|id| match (cols.id_to_dense.get(id), cols.cols.get(prop)) {
-                    (Some(&d), Some(col)) => col.is_present(d as usize),
+                    (Some(d), Some(col)) => col.is_present(d as usize),
                     // Either the columns never saw this entity or no such property
                     // exists anywhere; both read as null.
                     _ => false,
@@ -1182,7 +1369,7 @@ impl Graph {
         prop: &str,
     ) -> Result<Option<serde_json::Value>, Error> {
         self.edge_columns.with_fresh(&self.storage, |cols| {
-            cols.id_to_dense.get(&id).map(|&d| {
+            cols.id_to_dense.get(&id).map(|d| {
                 cols.cols
                     .get(prop)
                     .and_then(|c| c.get_json_opt(d as usize))
@@ -1233,10 +1420,7 @@ impl Graph {
     ) -> Result<Option<(serde_json::Value, serde_json::Value)>, Error> {
         Ok(self
             .prop_columns
-            .with_existing_mut(&self.storage, |cols| {
-                cols.prop_stats(prop)
-                    .map(|s| (s.min.clone(), s.max.clone()))
-            })?
+            .with_existing_mut(&self.storage, |cols| cols.min_max(prop))?
             .flatten())
     }
 
@@ -1352,7 +1536,14 @@ impl Graph {
             cache: WriteBatchCache::default(),
         };
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
-        match f(&mut txn) {
+        let outcome = f(&mut txn).and_then(|val| {
+            // The buffered adjacency and the batched counters land inside the
+            // same transaction, just before the commit.
+            txn.cache.flush_adjacency(&self.storage, &mut txn.wtxn)?;
+            txn.cache.flush_counters(&self.storage, &mut txn.wtxn)?;
+            Ok(val)
+        });
+        match outcome {
             Ok(val) => {
                 let WriteTxn {
                     wtxn,

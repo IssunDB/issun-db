@@ -177,7 +177,59 @@ impl<'a> WriteTxn<'a> {
     /// `node`, seeing edges added earlier in this same still-open
     /// transaction.
     pub fn all_neighbors(&self, node: NodeId) -> Result<Vec<DirectedNeighborEntry>, Error> {
-        self.graph.all_neighbors_impl(&self.wtxn, node)
+        if !self.cache.has_pending_adjacency() {
+            return self.graph.all_neighbors_impl(&self.wtxn, node);
+        }
+        let mut neighbors = Vec::new();
+        for ne in self.out_neighbors(node)? {
+            neighbors.push(DirectedNeighborEntry {
+                node: ne.node,
+                edge: ne.edge,
+                edge_type: ne.edge_type,
+                outgoing: true,
+            });
+        }
+        for ne in self.in_neighbors(node)? {
+            neighbors.push(DirectedNeighborEntry {
+                node: ne.node,
+                edge: ne.edge,
+                edge_type: ne.edge_type,
+                outgoing: false,
+            });
+        }
+        Ok(neighbors)
+    }
+
+    /// The stored entries plus the ones a bulk-load transaction still buffers,
+    /// in the order the store would return them once written.
+    fn neighbors_with_pending(
+        &self,
+        node: NodeId,
+        outgoing: bool,
+    ) -> Result<Vec<NeighborEntry>, Error> {
+        let stored = self.graph.adj_entries_impl(&self.wtxn, node, outgoing)?;
+        if !self.cache.has_pending_adjacency() {
+            return Ok(stored);
+        }
+        let mut entries: Vec<AdjEntry> = stored
+            .iter()
+            .map(|ne| AdjEntry {
+                edge_type: ne.edge_type,
+                other: ne.node,
+                edge_id: ne.edge,
+            })
+            .collect();
+        entries.extend(self.cache.pending_adj_of(node, outgoing));
+        // Duplicates under one key come back in byte order.
+        entries.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        Ok(entries
+            .into_iter()
+            .map(|e| NeighborEntry {
+                node: e.other,
+                edge: e.edge_id,
+                edge_type: e.edge_type,
+            })
+            .collect())
     }
 
     pub fn get_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, Error> {
@@ -185,11 +237,21 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn out_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
-        self.graph.out_neighbors_impl(&self.wtxn, node)
+        self.neighbors_with_pending(node, true)
     }
 
     pub fn in_neighbors(&self, node: NodeId) -> Result<Vec<NeighborEntry>, Error> {
-        self.graph.in_neighbors_impl(&self.wtxn, node)
+        self.neighbors_with_pending(node, false)
+    }
+
+    /// Switch this transaction to bulk-load mode: adjacency entries are
+    /// buffered and written sorted by node id, in chunks and at commit, which
+    /// is what keeps a multi-million-edge load from dirtying one B-tree page
+    /// per edge. Reads through this transaction still see every edge it has
+    /// added (the buffer is merged into them), so the mode changes cost, not
+    /// results. `COPY ... FROM` and `IMPORT DATABASE` use it.
+    pub fn begin_bulk_load(&mut self) {
+        self.cache.begin_bulk();
     }
 
     pub fn nodes_by_label(&self, label: &str) -> Result<Vec<NodeId>, Error> {
@@ -208,12 +270,25 @@ impl<'a> WriteTxn<'a> {
         self.graph.type_name_impl(&self.wtxn, id)
     }
 
+    /// The stored count plus this transaction's not-yet-flushed additions, so
+    /// a count read inside the transaction sees its own writes.
     pub fn node_count_by_label(&self, label: &str) -> Result<u64, Error> {
-        self.graph.node_count_by_label_impl(&self.wtxn, label)
+        let stored = self.graph.node_count_by_label_impl(&self.wtxn, label)?;
+        let delta = match get_label(&self.graph.storage, &self.wtxn, label)? {
+            Some(id) => self.cache.label_count_delta(id),
+            None => 0,
+        };
+        Ok((stored as i64 + delta).max(0) as u64)
     }
 
+    /// See [`WriteTxn::node_count_by_label`].
     pub fn edge_count_by_type(&self, etype: &str) -> Result<u64, Error> {
-        self.graph.edge_count_by_type_impl(&self.wtxn, etype)
+        let stored = self.graph.edge_count_by_type_impl(&self.wtxn, etype)?;
+        let delta = match get_type(&self.graph.storage, &self.wtxn, etype)? {
+            Some(id) => self.cache.type_count_delta(id),
+            None => 0,
+        };
+        Ok((stored as i64 + delta).max(0) as u64)
     }
 
     pub fn all_nodes(&self) -> Result<Vec<NodeId>, Error> {
@@ -287,7 +362,9 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn add_node(&mut self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
-        let node_id = self.graph.add_node_impl(&mut self.wtxn, &[label], props)?;
+        let node_id =
+            self.graph
+                .add_node_inner(&mut self.wtxn, Some(&mut self.cache), &[label], props)?;
         self.mutations_count += 1;
         self.delta.added_nodes.push(node_id);
         Ok(node_id)
@@ -299,7 +376,9 @@ impl<'a> WriteTxn<'a> {
         labels: &[&str],
         props: &impl Serialize,
     ) -> Result<NodeId, Error> {
-        let node_id = self.graph.add_node_impl(&mut self.wtxn, labels, props)?;
+        let node_id =
+            self.graph
+                .add_node_inner(&mut self.wtxn, Some(&mut self.cache), labels, props)?;
         self.mutations_count += 1;
         self.delta.added_nodes.push(node_id);
         Ok(node_id)
@@ -314,21 +393,28 @@ impl<'a> WriteTxn<'a> {
 
     /// Add a label to an existing node inside this write transaction.
     pub fn add_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
-        self.graph.add_label_impl(&mut self.wtxn, id, label)?;
+        self.graph
+            .add_label_inner(&mut self.wtxn, Some(&mut self.cache), id, label)?;
         self.mutations_count += 1;
         Ok(())
     }
 
     /// Remove a label from an existing node inside this write transaction.
     pub fn remove_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
-        self.graph.remove_label_impl(&mut self.wtxn, id, label)?;
+        self.graph
+            .remove_label_inner(&mut self.wtxn, Some(&mut self.cache), id, label)?;
         self.mutations_count += 1;
         Ok(())
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
         self.cache.invalidate_nodes();
-        self.graph.delete_node_impl(&mut self.wtxn, id)?;
+        // A deletion walks the adjacency stores, so the buffered entries go
+        // in first.
+        self.cache
+            .flush_adjacency(&self.graph.storage, &mut self.wtxn)?;
+        self.graph
+            .delete_node_inner(&mut self.wtxn, Some(&mut self.cache), id)?;
         self.mutations_count += 1;
         // A node deletion cascades to every incident edge, so the property columns
         // and the CSR snapshot rebuild rather than patch.
@@ -337,7 +423,13 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
-        if self.graph.delete_edge_impl(&mut self.wtxn, id)?.is_some() {
+        self.cache
+            .flush_adjacency(&self.graph.storage, &mut self.wtxn)?;
+        if self
+            .graph
+            .delete_edge_inner(&mut self.wtxn, Some(&mut self.cache), id)?
+            .is_some()
+        {
             self.delta.removed_edge = true;
         }
         self.mutations_count += 1;
@@ -657,6 +749,149 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// In bulk-load mode the adjacency entries are buffered and written sorted
+    /// at commit, and that must be invisible: reads inside the transaction see
+    /// the buffered edges in store order, a deletion inside it finds them, and
+    /// the committed adjacency (through point lookups and a snapshot built
+    /// from storage) equals what one put per edge produces.
+    #[test]
+    fn bulk_load_buffers_adjacency_without_changing_results() {
+        let (_dir, g) = open_tmp();
+        let n: Vec<NodeId> = (0..4)
+            .map(|_| g.add_node("N", &json!({})).unwrap())
+            .collect();
+        let seed = g.add_edge(n[0], n[1], "T", &json!({})).unwrap();
+
+        let (kept, dropped) = g
+            .update(|t| {
+                t.begin_bulk_load();
+                let e1 = t.add_edge(n[0], n[2], "T", &json!({}))?;
+                let e2 = t.add_edge(n[3], n[0], "U", &json!({}))?;
+                let e3 = t.add_edge(n[0], n[1], "T", &json!({}))?;
+                // Reads merge the buffer with the store, in the store's order.
+                let out: Vec<EdgeId> = t.out_neighbors(n[0])?.iter().map(|e| e.edge).collect();
+                let mut want = vec![seed, e1, e3];
+                want.sort_unstable();
+                let mut got = out.clone();
+                got.sort_unstable();
+                assert_eq!(got, want);
+                assert_eq!(
+                    t.in_neighbors(n[0])?
+                        .iter()
+                        .map(|e| e.edge)
+                        .collect::<Vec<_>>(),
+                    vec![e2]
+                );
+                assert_eq!(t.all_neighbors(n[0])?.len(), 4);
+                assert_eq!(t.edge_count_by_type("T")?, 3);
+                // A deletion flushes the buffer first and finds the edge.
+                t.delete_edge(e3)?;
+                assert_eq!(t.edge_count_by_type("T")?, 2);
+                Ok((vec![e1, e2], e3))
+            })
+            .unwrap();
+
+        assert!(g.get_edge(dropped).unwrap().is_none());
+        let mut out: Vec<EdgeId> = g
+            .out_neighbors(n[0])
+            .unwrap()
+            .iter()
+            .map(|e| e.edge)
+            .collect();
+        out.sort_unstable();
+        assert_eq!(out, vec![seed, kept[0]]);
+        assert_eq!(
+            g.in_neighbors(n[0])
+                .unwrap()
+                .iter()
+                .map(|e| e.edge)
+                .collect::<Vec<_>>(),
+            vec![kept[1]]
+        );
+        assert_eq!(g.edge_count_by_type("T").unwrap(), 2);
+        assert_eq!(g.edge_count_by_type("U").unwrap(), 1);
+
+        // The stored adjacency is what per-edge puts would have written: a
+        // snapshot built from it equals one built after the same edges were
+        // added one transaction at a time.
+        let bulk = CsrSnapshot::build(&g.storage).unwrap();
+        let (_dir2, g2) = open_tmp();
+        let m: Vec<NodeId> = (0..4)
+            .map(|_| g2.add_node("N", &json!({})).unwrap())
+            .collect();
+        g2.add_edge(m[0], m[1], "T", &json!({})).unwrap();
+        g2.add_edge(m[0], m[2], "T", &json!({})).unwrap();
+        g2.add_edge(m[3], m[0], "U", &json!({})).unwrap();
+        let e3b = g2.add_edge(m[0], m[1], "T", &json!({})).unwrap();
+        g2.delete_edge(e3b).unwrap();
+        let single = CsrSnapshot::build(&g2.storage).unwrap();
+        assert_eq!(bulk.row_ptr, single.row_ptr);
+        assert_eq!(bulk.col_idx, single.col_idx);
+        assert_eq!(bulk.edge_type, single.edge_type);
+        assert_eq!(bulk.in_row_ptr, single.in_row_ptr);
+        assert_eq!(bulk.in_col_idx, single.in_col_idx);
+    }
+
+    /// Ids and counts are batched per write transaction: a transaction sees its
+    /// own additions in the counts it reads, hands out distinct ids in one run,
+    /// the commit persists both, a later transaction continues the id sequence,
+    /// and a deletion in the same transaction (which adjusts the stored counter
+    /// directly) combines with the batched additions rather than being
+    /// overwritten by them.
+    #[test]
+    fn batched_counters_are_visible_in_the_transaction_and_persist() {
+        let (_dir, g) = open_tmp();
+        let seed = g.add_node("P", &json!({})).unwrap();
+        let (ids, e) = g
+            .update(|t| {
+                let a = t.add_node("P", &json!({}))?;
+                let b = t.add_node_multi(&["P", "Q"], &json!({}))?;
+                let e = t.add_edge(a, b, "R", &json!({}))?;
+                t.add_edge(b, a, "R", &json!({}))?;
+                assert_eq!(t.node_count_by_label("P")?, 3);
+                assert_eq!(t.node_count_by_label("Q")?, 1);
+                assert_eq!(t.edge_count_by_type("R")?, 2);
+                assert_eq!(t.edge_count_by_type("NOPE")?, 0);
+                t.delete_edge(e)?;
+                assert_eq!(t.edge_count_by_type("R")?, 1);
+                Ok((vec![a, b], e))
+            })
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![seed + 1, seed + 2],
+            "ids continue the stored sequence"
+        );
+        assert_eq!(g.node_count_by_label("P").unwrap(), 3);
+        assert_eq!(g.node_count_by_label("Q").unwrap(), 1);
+        assert_eq!(g.edge_count_by_type("R").unwrap(), 1);
+        assert!(g.get_edge(e).unwrap().is_none());
+
+        let later = g.add_node("P", &json!({})).unwrap();
+        assert_eq!(
+            later,
+            seed + 3,
+            "the flushed counter is where the next id starts"
+        );
+        let in_txn = g.update(|t| t.add_node("P", &json!({}))).unwrap();
+        assert_eq!(in_txn, seed + 4);
+        let edge_after = g.add_edge(later, in_txn, "R", &json!({})).unwrap();
+        assert_eq!(
+            edge_after,
+            e + 2,
+            "edge ids continue past the batch's allocations"
+        );
+
+        // A transaction that fails flushes nothing: the counters stay as committed.
+        let failed: Result<(), Error> = g.update(|t| {
+            t.add_node("P", &json!({}))?;
+            Err(Error::InvalidArgument("abort".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(g.node_count_by_label("P").unwrap(), 5);
+        assert_eq!(g.add_node("P", &json!({})).unwrap(), seed + 5);
     }
 
     #[test]

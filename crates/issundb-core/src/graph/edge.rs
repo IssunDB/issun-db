@@ -98,11 +98,21 @@ impl Graph {
                 id
             }
         };
-        let edge_id = alloc_edge_id(&self.storage, wtxn)?;
+        let edge_id = match cache.as_deref_mut() {
+            Some(c) => c.alloc_edge_id(&self.storage, wtxn)?,
+            None => alloc_edge_id(&self.storage, wtxn)?,
+        };
         let encoded_props = props::encode(props)?;
 
         // Validate constraints and populate indexes
-        self.write_edge_index_entries_cached(wtxn, cache, edge_id, type_id, etype, &encoded_props)?;
+        self.write_edge_index_entries_cached(
+            wtxn,
+            cache.as_deref_mut(),
+            edge_id,
+            type_id,
+            etype,
+            &encoded_props,
+        )?;
 
         let record = EdgeRecord {
             src,
@@ -114,10 +124,20 @@ impl Graph {
             .edges
             .put(wtxn, &edge_id, &props::encode(&record)?)?;
 
-        self.append_adj(wtxn, src, dst, type_id, edge_id, true)?;
-        self.append_adj(wtxn, dst, src, type_id, edge_id, false)?;
+        match cache.as_deref_mut() {
+            Some(c) if c.is_bulk() => {
+                c.defer_adj(&self.storage, wtxn, src, dst, type_id, edge_id)?;
+            }
+            _ => {
+                self.append_adj(wtxn, src, dst, type_id, edge_id, true)?;
+                self.append_adj(wtxn, dst, src, type_id, edge_id, false)?;
+            }
+        }
 
-        adjust_type_count(&self.storage, wtxn, type_id, 1)?;
+        match cache {
+            Some(c) => c.bump_type_count(type_id, 1),
+            None => adjust_type_count(&self.storage, wtxn, type_id, 1)?,
+        }
 
         Ok((edge_id, type_id))
     }
@@ -223,6 +243,17 @@ impl Graph {
         wtxn: &mut crate::storage::RwTxn,
         id: EdgeId,
     ) -> Result<Option<(NodeId, NodeId)>, Error> {
+        self.delete_edge_inner(wtxn, None, id)
+    }
+
+    /// [`Graph::delete_edge_impl`] with the transaction's batch cache, which
+    /// takes the type count change so it combines with the batch's additions.
+    pub(super) fn delete_edge_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        cache: Option<&mut super::WriteBatchCache>,
+        id: EdgeId,
+    ) -> Result<Option<(NodeId, NodeId)>, Error> {
         let record: EdgeRecord = match self.get_edge_impl(wtxn, id)? {
             Some(rec) => rec,
             None => return Ok(None),
@@ -232,7 +263,10 @@ impl Graph {
 
         self.storage.edges.delete(wtxn, &id)?;
 
-        adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?;
+        match cache {
+            Some(c) => c.bump_type_count(record.edge_type, -1),
+            None => adjust_type_count(&self.storage, wtxn, record.edge_type, -1)?,
+        }
 
         let out_entry = AdjEntry {
             edge_type: record.edge_type,

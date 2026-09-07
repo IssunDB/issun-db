@@ -256,3 +256,27 @@ fn generate_db_id() -> [u8; 16] {
     }
     id
 }
+
+/// Write `entries`, sorted by key and then by value bytes, into a duplicate
+/// table through one cursor. LMDB positions a cursor with a full descent from
+/// the root on every `put`, but an already positioned cursor whose next key
+/// lands on the same leaf skips the descent, so a sorted run through one
+/// cursor touches each leaf page once. The bulk adjacency flush is the caller.
+pub(crate) fn put_sorted_duplicates(
+    db: &Database<U64<BE>, Bytes>,
+    txn: &mut RwTxn<'_>,
+    entries: &[(u64, &[u8])],
+) -> Result<(), Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut cursor = db.iter_mut(txn)?;
+    for (key, value) in entries {
+        // SAFETY: no value borrowed from this database is held across the
+        // call; `key` and `value` are the caller's own buffers.
+        unsafe {
+            cursor.put_current_with_options::<Bytes>(heed::PutFlags::empty(), key, value)?;
+        }
+    }
+    Ok(())
+}

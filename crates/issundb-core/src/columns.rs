@@ -16,6 +16,7 @@
 use ahash::AHashMap;
 use serde_json::Value;
 
+use crate::array::Array;
 use crate::error::Error;
 use crate::schema::{EdgeId, EdgeRecord, NodeId, NodeRecord};
 use crate::storage::{Storage, props};
@@ -35,8 +36,13 @@ pub(crate) trait ColumnSource {
     const CACHE_FILE: &'static str;
 
     /// Decode every entity's user properties as JSON, in storage iteration
-    /// order. Each item is `(id, props_json)`.
-    fn scan_all(storage: &Storage) -> Result<Vec<(Self::Id, Value)>, Error>;
+    /// order, handing each `(id, props_json)` to `f` as it is decoded. The
+    /// whole-graph build streams through here so that no more than one
+    /// entity's decoded properties are alive at a time.
+    fn for_each(
+        storage: &Storage,
+        f: &mut dyn FnMut(Self::Id, Value) -> Result<(), Error>,
+    ) -> Result<(), Error>;
 
     /// Decode one entity's user properties as JSON through a caller-supplied
     /// transaction; `None` if it no longer exists (deleted between commit and
@@ -89,15 +95,17 @@ impl ColumnSource for NodeSource {
     #[cfg(feature = "lmdb")]
     const CACHE_FILE: &'static str = "node_columns.cache";
 
-    fn scan_all(storage: &Storage) -> Result<Vec<(NodeId, Value)>, Error> {
+    fn for_each(
+        storage: &Storage,
+        f: &mut dyn FnMut(NodeId, Value) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let rtxn = storage.env.read_txn()?;
-        let mut out = Vec::new();
         for entry in storage.nodes.iter(&rtxn)? {
             let (id, bytes) = entry?;
             let rec: NodeRecord = props::decode(bytes)?;
-            out.push((id, props::decode(&rec.props)?));
+            f(id, props::decode(&rec.props)?)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn get_in_txn(
@@ -128,15 +136,17 @@ impl ColumnSource for EdgeSource {
     #[cfg(feature = "lmdb")]
     const CACHE_FILE: &'static str = "edge_columns.cache";
 
-    fn scan_all(storage: &Storage) -> Result<Vec<(EdgeId, Value)>, Error> {
+    fn for_each(
+        storage: &Storage,
+        f: &mut dyn FnMut(EdgeId, Value) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let rtxn = storage.env.read_txn()?;
-        let mut out = Vec::new();
         for entry in storage.edges.iter(&rtxn)? {
             let (id, bytes) = entry?;
             let rec: EdgeRecord = props::decode(bytes)?;
-            out.push((id, props::decode(&rec.props)?));
+            f(id, props::decode(&rec.props)?)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn get_in_txn(
@@ -158,30 +168,252 @@ impl ColumnSource for EdgeSource {
     }
 }
 
+/// A bit per dense slot, packed into 64-bit words.
+#[derive(Clone, Default)]
+pub(crate) struct Bitmap {
+    words: Array<u64>,
+    len: usize,
+}
+
+impl Bitmap {
+    fn words_for(len: usize) -> usize {
+        len.div_ceil(64)
+    }
+
+    fn zeroed(len: usize) -> Self {
+        Self {
+            words: vec![0u64; Self::words_for(len)].into(),
+            len,
+        }
+    }
+
+    /// Wrap mapped or owned words covering `len` bits; `None` when the word
+    /// count does not fit the length.
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn from_words(words: Array<u64>, len: usize) -> Option<Self> {
+        (words.len() == Self::words_for(len)).then_some(Self { words, len })
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn words(&self) -> &Array<u64> {
+        &self.words
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> bool {
+        debug_assert!(i < self.len);
+        (self.words[i / 64] >> (i % 64)) & 1 == 1
+    }
+
+    fn set(&mut self, i: usize, on: bool) {
+        debug_assert!(i < self.len);
+        self.words.with_mut(|w| {
+            let mask = 1u64 << (i % 64);
+            if on {
+                w[i / 64] |= mask;
+            } else {
+                w[i / 64] &= !mask;
+            }
+        });
+    }
+
+    fn grow(&mut self, len: usize) {
+        if len > self.len {
+            let words = Self::words_for(len);
+            self.words.with_mut(|w| w.resize(words, 0));
+            self.len = len;
+        }
+    }
+}
+
+/// A column of plain values with a presence bit per slot, the layout a
+/// `Vec<Option<T>>` is not: one byte of tag per eight bytes of value rather
+/// than a doubled slot, and both halves mappable from a cache file. A slot
+/// whose bit is clear holds an unspecified value that no reader returns.
+#[derive(Clone)]
+pub(crate) struct Nullable<T: Copy> {
+    present: Bitmap,
+    values: Array<T>,
+}
+
+impl<T: Copy + Default> Nullable<T> {
+    fn with_len(len: usize) -> Self {
+        Self {
+            present: Bitmap::zeroed(len),
+            values: vec![T::default(); len].into(),
+        }
+    }
+
+    /// Pair mapped or owned parts; `None` when their lengths disagree.
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn from_parts(present: Bitmap, values: Array<T>) -> Option<Self> {
+        (present.len() == values.len()).then_some(Self { present, values })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<T> {
+        self.present.get(i).then(|| self.values[i])
+    }
+
+    #[inline]
+    pub(crate) fn is_some(&self, i: usize) -> bool {
+        self.present.get(i)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Option<T>> + '_ {
+        (0..self.len()).map(move |i| self.get(i))
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn present(&self) -> &Bitmap {
+        &self.present
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn values(&self) -> &Array<T> {
+        &self.values
+    }
+
+    fn set(&mut self, i: usize, v: Option<T>) {
+        match v {
+            Some(x) => {
+                self.values.with_mut(|vals| vals[i] = x);
+                self.present.set(i, true);
+            }
+            None => self.present.set(i, false),
+        }
+    }
+
+    fn grow(&mut self, len: usize) {
+        if len > self.len() {
+            self.values.with_mut(|vals| vals.resize(len, T::default()));
+            self.present.grow(len);
+        }
+    }
+}
+
+/// The distinct strings of a dictionary-encoded column: `offsets[i]..offsets[i+1]`
+/// bounds string `i` in `bytes`. The interning map is derived, built on the
+/// first intern after a load rather than stored.
+#[derive(Clone, Default)]
+pub(crate) struct StrDict {
+    offsets: Array<u64>,
+    bytes: Array<u8>,
+    lookup: Option<AHashMap<String, u32>>,
+}
+
+impl StrDict {
+    fn new() -> Self {
+        Self {
+            offsets: vec![0u64].into(),
+            bytes: Array::default(),
+            lookup: Some(AHashMap::new()),
+        }
+    }
+
+    /// Wrap mapped or owned parts; `None` unless the offsets are a
+    /// non-decreasing sequence ending at the byte length that bounds valid
+    /// UTF-8 at every boundary, so `get` can never slice a broken string.
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn from_parts(offsets: Array<u64>, bytes: Array<u8>) -> Option<Self> {
+        let first = *offsets.first()?;
+        if first != 0 || *offsets.last()? != bytes.len() as u64 {
+            return None;
+        }
+        for w in offsets.windows(2) {
+            let (a, b) = (usize::try_from(w[0]).ok()?, usize::try_from(w[1]).ok()?);
+            if a > b || std::str::from_utf8(bytes.get(a..b)?).is_err() {
+                return None;
+            }
+        }
+        Some(Self {
+            offsets,
+            bytes,
+            lookup: None,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> &str {
+        let (a, b) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
+        // Validated at construction (`from_parts`) or written by `intern`.
+        std::str::from_utf8(&self.bytes[a..b]).unwrap_or("")
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.len()).map(move |i| self.get(i))
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn offsets(&self) -> &Array<u64> {
+        &self.offsets
+    }
+
+    #[cfg(feature = "lmdb")]
+    pub(crate) fn bytes(&self) -> &Array<u8> {
+        &self.bytes
+    }
+
+    /// The code of `s`, appending it when new.
+    fn intern(&mut self, s: &str) -> u32 {
+        if self.lookup.is_none() {
+            let map = self
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.to_owned(), i as u32))
+                .collect();
+            self.lookup = Some(map);
+        }
+        if let Some(&i) = self.lookup.as_ref().and_then(|m| m.get(s)) {
+            return i;
+        }
+        let i = self.len() as u32;
+        self.bytes.with_mut(|b| b.extend_from_slice(s.as_bytes()));
+        let end = self.bytes.len() as u64;
+        self.offsets.with_mut(|o| o.push(end));
+        if let Some(map) = self.lookup.as_mut() {
+            map.insert(s.to_owned(), i);
+        }
+        i
+    }
+}
+
 /// One typed column over dense node indices.
 ///
-/// The serde derives exist for the columns cache file (see [`crate::cache_file`]);
-/// `lookup` is skipped there because it is derivable from `dict`, and
-/// [`PropColumn::rebuild_lookup`] restores it after a load.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// The typed variants are plain arrays behind [`Array`], so a column loaded
+/// from a cache file is a view of the mapped file until the first patch
+/// touches it. `Json` is the exact-semantics fallback and always lives on the
+/// heap.
 pub(crate) enum PropColumn {
-    Int(Vec<Option<i64>>),
-    Float(Vec<Option<f64>>),
-    Bool(Vec<Option<bool>>),
+    Int(Nullable<i64>),
+    Float(Nullable<f64>),
+    /// `1` for true, `0` for false; absent when the presence bit is clear.
+    Bool(Nullable<u8>),
     /// Dictionary-encoded strings: `idx[dense]` points into `dict`;
-    /// `u32::MAX` marks null or missing.
+    /// `STR_NULL` marks null or missing.
     Str {
-        dict: Vec<String>,
-        #[serde(skip)]
-        lookup: AHashMap<String, u32>,
-        idx: Vec<u32>,
+        dict: StrDict,
+        idx: Array<u32>,
     },
     /// Exact-semantics fallback for mixed-kind, array, object, or
     /// out-of-range numeric values.
     Json(Vec<Option<Value>>),
 }
 
-const STR_NULL: u32 = u32::MAX;
+pub(crate) const STR_NULL: u32 = u32::MAX;
 
 thread_local! {
     /// Set while a deliberate materialize is running on this thread.
@@ -278,64 +510,65 @@ fn kind_of(v: &Value) -> Kind {
     }
 }
 
-impl PropColumn {
-    /// Build the tightest column for `values` (one slot per dense index).
-    fn from_values(values: Vec<Option<Value>>) -> Self {
-        let mut kind = Kind::Null;
-        for v in values.iter().flatten() {
-            let k = kind_of(v);
-            if k == Kind::Null {
-                continue;
-            }
-            if kind == Kind::Null {
-                kind = k;
-            } else if kind != k {
-                kind = Kind::Other;
-                break;
-            }
-        }
-        match kind {
-            Kind::Int => Self::Int(
-                values
-                    .into_iter()
-                    .map(|v| v.and_then(|v| v.as_i64()))
-                    .collect(),
-            ),
-            Kind::Float => Self::Float(
-                values
-                    .into_iter()
-                    .map(|v| v.and_then(|v| v.as_f64()))
-                    .collect(),
-            ),
-            Kind::Bool => Self::Bool(
-                values
-                    .into_iter()
-                    .map(|v| v.and_then(|v| v.as_bool()))
-                    .collect(),
-            ),
-            Kind::Str => {
-                let mut dict = Vec::new();
-                let mut lookup: AHashMap<String, u32> = AHashMap::new();
-                let mut idx = Vec::with_capacity(values.len());
-                for v in values {
-                    match v {
-                        Some(Value::String(s)) => idx.push(intern(&mut dict, &mut lookup, s)),
-                        _ => idx.push(STR_NULL),
-                    }
-                }
-                Self::Str { dict, lookup, idx }
-            }
-            // All-null columns are stored as Json so a later patch of any kind
-            // fits without a degrade.
-            Kind::Null | Kind::Other => Self::Json(
-                values
-                    .into_iter()
-                    .map(|v| v.filter(|v| !v.is_null()))
-                    .collect(),
-            ),
+/// Accumulates one property's values slot by slot during a build, choosing the
+/// tightest column kind as it goes and degrading to `Json` at the first value
+/// of another kind. Slots not pushed read as null, so a property first seen at
+/// dense index `d` starts with `d` nulls without any caller having to say so.
+///
+/// This is what lets the build stream: the whole-graph scan pushes each
+/// entity's values as it decodes them and drops the decoded map before the
+/// next entity, where holding every entity's `Value` until the end peaked at
+/// three times the finished columns' size.
+pub(crate) struct ColumnBuilder {
+    col: PropColumn,
+}
+
+impl ColumnBuilder {
+    fn new() -> Self {
+        Self {
+            col: PropColumn::Json(Vec::new()),
         }
     }
 
+    /// Slots pushed so far.
+    fn len(&self) -> usize {
+        self.col.len()
+    }
+
+    /// Record `value` at `dense`, which must not precede any slot already
+    /// pushed; the gap up to it is filled with nulls.
+    fn push(&mut self, dense: usize, value: Value) {
+        debug_assert!(dense >= self.len());
+        self.col.grow(dense + 1);
+        if value.is_null() {
+            return;
+        }
+        // An all-null column has no kind yet; the first non-null value picks one.
+        let untyped = matches!(&self.col, PropColumn::Json(v) if v.iter().all(Option::is_none));
+        if untyped {
+            let n = self.len();
+            self.col = match kind_of(&value) {
+                Kind::Int => PropColumn::Int(Nullable::with_len(n)),
+                Kind::Float => PropColumn::Float(Nullable::with_len(n)),
+                Kind::Bool => PropColumn::Bool(Nullable::with_len(n)),
+                Kind::Str => PropColumn::Str {
+                    dict: StrDict::new(),
+                    idx: vec![STR_NULL; n].into(),
+                },
+                Kind::Null | Kind::Other => PropColumn::Json(vec![None; n]),
+            };
+        }
+        self.col.set(dense, value);
+    }
+
+    /// The finished column over `n` slots.
+    fn finish(mut self, n: usize) -> PropColumn {
+        self.col.grow(n);
+        self.col
+    }
+}
+
+impl PropColumn {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Int(v) => v.len(),
@@ -349,21 +582,29 @@ impl PropColumn {
     /// Grow the column with nulls to cover `len` dense slots.
     fn grow(&mut self, len: usize) {
         match self {
-            Self::Int(v) => v.resize(len, None),
-            Self::Float(v) => v.resize(len, None),
-            Self::Bool(v) => v.resize(len, None),
-            Self::Str { idx, .. } => idx.resize(len, STR_NULL),
-            Self::Json(v) => v.resize(len, None),
+            Self::Int(v) => v.grow(len),
+            Self::Float(v) => v.grow(len),
+            Self::Bool(v) => v.grow(len),
+            Self::Str { idx, .. } => {
+                if len > idx.len() {
+                    idx.with_mut(|i| i.resize(len, STR_NULL));
+                }
+            }
+            Self::Json(v) => {
+                if len > v.len() {
+                    v.resize(len, None);
+                }
+            }
         }
     }
 
     /// Clear one slot to null.
     fn clear(&mut self, dense: usize) {
         match self {
-            Self::Int(v) => v[dense] = None,
-            Self::Float(v) => v[dense] = None,
-            Self::Bool(v) => v[dense] = None,
-            Self::Str { idx, .. } => idx[dense] = STR_NULL,
+            Self::Int(v) => v.set(dense, None),
+            Self::Float(v) => v.set(dense, None),
+            Self::Bool(v) => v.set(dense, None),
+            Self::Str { idx, .. } => idx.with_mut(|i| i[dense] = STR_NULL),
             Self::Json(v) => v[dense] = None,
         }
     }
@@ -373,12 +614,13 @@ impl PropColumn {
     fn set(&mut self, dense: usize, value: Value) {
         match (&mut *self, kind_of(&value)) {
             (_, Kind::Null) => self.clear(dense),
-            (Self::Int(v), Kind::Int) => v[dense] = value.as_i64(),
-            (Self::Float(v), Kind::Float) => v[dense] = value.as_f64(),
-            (Self::Bool(v), Kind::Bool) => v[dense] = value.as_bool(),
-            (Self::Str { dict, lookup, idx }, Kind::Str) => {
+            (Self::Int(v), Kind::Int) => v.set(dense, value.as_i64()),
+            (Self::Float(v), Kind::Float) => v.set(dense, value.as_f64()),
+            (Self::Bool(v), Kind::Bool) => v.set(dense, value.as_bool().map(u8::from)),
+            (Self::Str { dict, idx }, Kind::Str) => {
                 if let Value::String(s) = value {
-                    idx[dense] = intern(dict, lookup, s);
+                    let code = dict.intern(&s);
+                    idx.with_mut(|i| i[dense] = code);
                 }
             }
             (Self::Json(v), _) => v[dense] = Some(value),
@@ -402,60 +644,34 @@ impl PropColumn {
     /// entry). Backs the grouped-degree kernel's `count(v.prop)` null filter.
     pub(crate) fn is_present(&self, dense: usize) -> bool {
         match self {
-            Self::Int(v) => v[dense].is_some(),
-            Self::Float(v) => v[dense].is_some(),
-            Self::Bool(v) => v[dense].is_some(),
+            Self::Int(v) => v.is_some(dense),
+            Self::Float(v) => v.is_some(dense),
+            Self::Bool(v) => v.is_some(dense),
             Self::Str { idx, .. } => idx[dense] != STR_NULL,
             Self::Json(v) => v[dense].is_some(),
-        }
-    }
-
-    /// Restore the interning `lookup` from `dict` after a cache file load, which
-    /// skips it as derivable. A no-op on every other variant.
-    ///
-    /// Cache files are an LMDB-only structure, so without that feature nothing
-    /// loads a column set from bytes and this has no caller.
-    #[cfg(feature = "lmdb")]
-    pub(crate) fn rebuild_lookup(&mut self) {
-        if let Self::Str { dict, lookup, .. } = self {
-            *lookup = dict
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.clone(), i as u32))
-                .collect();
         }
     }
 
     /// The value at `dense`, or `None` for null/missing.
     pub(crate) fn get_json_opt(&self, dense: usize) -> Option<Value> {
         match self {
-            Self::Int(v) => v[dense].map(Value::from),
-            Self::Float(v) => v[dense].map(Value::from),
-            Self::Bool(v) => v[dense].map(Value::from),
-            Self::Str { dict, idx, .. } => match idx[dense] {
+            Self::Int(v) => v.get(dense).map(Value::from),
+            Self::Float(v) => v.get(dense).map(Value::from),
+            Self::Bool(v) => v.get(dense).map(|b| Value::Bool(b != 0)),
+            Self::Str { dict, idx } => match idx[dense] {
                 STR_NULL => None,
-                i => Some(Value::String(dict[i as usize].clone())),
+                i => Some(Value::String(dict.get(i as usize).to_owned())),
             },
             Self::Json(v) => v[dense].clone(),
         }
     }
 }
 
-fn intern(dict: &mut Vec<String>, lookup: &mut AHashMap<String, u32>, s: String) -> u32 {
-    if let Some(&i) = lookup.get(&s) {
-        return i;
-    }
-    let i = dict.len() as u32;
-    dict.push(s.clone());
-    lookup.insert(s, i);
-    i
-}
-
 /// Lazily computed distribution statistics over one typed column's non-null
-/// values: bounds, an equi-depth histogram, and the most common values.
+/// values: an equi-depth histogram and the most common values. The bounds live
+/// in their own cache (`PropColumns::min_max`), because they cost one pass
+/// where the histogram costs a sort.
 pub(crate) struct PropStats {
-    pub(crate) min: Value,
-    pub(crate) max: Value,
     pub(crate) histogram: crate::histogram::Histogram,
     /// Up to [`MCV_LIMIT`] `(value, row_count)` pairs, most frequent first.
     pub(crate) mcvs: Vec<(Value, u64)>,
@@ -481,8 +697,8 @@ impl PropStats {
 /// The materialized column set with its own dense entity mapping. Generic over
 /// the [`ColumnSource`] that supplies the entities (nodes or edges).
 pub(crate) struct PropColumns<S: ColumnSource> {
-    pub(crate) id_to_dense: AHashMap<S::Id, u32>,
-    pub(crate) dense_to_id: Vec<S::Id>,
+    pub(crate) id_to_dense: crate::csr::DenseIndex,
+    pub(crate) dense_to_id: Array<S::Id>,
     pub(crate) cols: AHashMap<String, PropColumn>,
     /// Per-property stats, computed on first access through [`prop_stats`]
     /// and invalidated wholesale by [`patch`] (a patch clears the touched
@@ -490,6 +706,11 @@ pub(crate) struct PropColumns<S: ColumnSource> {
     /// `None` is cached for columns with no usable stats (`Json` fallback
     /// columns and all-null columns).
     stats: AHashMap<String, Option<PropStats>>,
+    /// Per-property bounds, computed on first access by one pass over the
+    /// column and cached like `stats`. The zone-map prune asks for these on
+    /// every query that filters a property, and computing them through
+    /// `prop_stats` cost a sort of every value for a question one pass answers.
+    bounds: AHashMap<String, Option<(Value, Value)>>,
 }
 
 /// The cache file's view of a column set. Compiled only with `lmdb`, because the
@@ -502,98 +723,117 @@ impl<S: ColumnSource<Id = u64>> PropColumns<S> {
     /// do. `None` when any column's length disagrees with the dense mapping,
     /// which marks the payload as not describing one entity set.
     pub(crate) fn from_cache_file(
-        dense_to_id: Vec<u64>,
+        dense_to_id: Array<u64>,
         cols: Vec<(String, PropColumn)>,
     ) -> Option<Self> {
         let n = dense_to_id.len();
         let mut map: AHashMap<String, PropColumn> = AHashMap::with_capacity(cols.len());
-        for (name, mut col) in cols {
+        for (name, col) in cols {
             if col.len() != n {
                 return None;
             }
-            col.rebuild_lookup();
             map.insert(name, col);
         }
-        let id_to_dense = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(d, &id)| (id, d as u32))
-            .collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
         Some(Self {
             id_to_dense,
             dense_to_id,
             cols: map,
             stats: AHashMap::new(),
+            bounds: AHashMap::new(),
         })
     }
 
     /// The cache file payload view of this column set, the dense mapping and
     /// the columns in name order, so a save is deterministic.
-    pub(crate) fn cache_file_parts(&self) -> (&Vec<u64>, Vec<(&String, &PropColumn)>) {
+    pub(crate) fn cache_file_parts(&self) -> (&Array<u64>, Vec<(&String, &PropColumn)>) {
         let mut cols: Vec<(&String, &PropColumn)> = self.cols.iter().collect();
         cols.sort_by_key(|(name, _)| *name);
         (&self.dense_to_id, cols)
     }
 }
 
-impl<S: ColumnSource> PropColumns<S> {
-    /// Build columns for every property name present, from one full scan.
+impl<S: ColumnSource<Id = u64>> PropColumns<S> {
+    /// Build columns for every property name present, from one full scan,
+    /// streaming: each entity's decoded properties go straight into the
+    /// per-property builders and are dropped before the next entity is read.
     fn build(storage: &Storage) -> Result<Self, Error> {
-        Ok(Self::from_items(S::scan_all(storage)?))
+        let mut dense_to_id: Vec<S::Id> = Vec::new();
+        let mut builders: AHashMap<String, ColumnBuilder> = AHashMap::new();
+        S::for_each(storage, &mut |id, json| {
+            let dense = dense_to_id.len();
+            dense_to_id.push(id);
+            if let Value::Object(map) = json {
+                for (k, v) in map {
+                    builders
+                        .entry(k)
+                        .or_insert_with(ColumnBuilder::new)
+                        .push(dense, v);
+                }
+            }
+            Ok(())
+        })?;
+        let n = dense_to_id.len();
+        let cols = builders
+            .into_iter()
+            .map(|(k, b)| (k, b.finish(n)))
+            .collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
+        Ok(Self {
+            id_to_dense,
+            dense_to_id: dense_to_id.into(),
+            cols,
+            stats: AHashMap::new(),
+            bounds: AHashMap::new(),
+        })
     }
 
-    /// Build columns over exactly `items`, rather than over every entity.
+    /// Build columns over exactly `items`, rather than over every entity, and
+    /// restricted to one property when `only` names it.
     ///
-    /// The whole-graph build goes through here too, so a partial set is grouped by
-    /// the same code. That equivalence is what lets a small grouped read skip the
-    /// full scan: the only thing a narrower population can change is the inferred
-    /// column kind, and it can only make it *more* specific (fewer distinct kinds
-    /// present), never less. Every specific arm yields the same representative
-    /// `Value` and the same grouping identity the `Json` fallback would: `Int`
-    /// re-wraps through `Value::from(i64)`, `Float` keys on `to_bits`, which the
-    /// fallback's shortest-roundtrip string matches, and `Str` clones the same
-    /// string. An out-of-range `u64` is `Kind::Other` in `kind_of`, so no arm can
-    /// silently null a value the fallback would have kept.
-    pub(crate) fn from_items(items: Vec<(S::Id, Value)>) -> Self {
-        Self::from_items_for(items, None)
-    }
-
-    /// [`PropColumns::from_items`] restricted to one property.
+    /// A partial set is grouped by the same builders as the whole-graph build.
+    /// That equivalence is what lets a small grouped read skip the full scan: the
+    /// only thing a narrower population can change is the inferred column kind,
+    /// and it can only make it *more* specific (fewer distinct kinds present),
+    /// never less. Every specific arm yields the same representative `Value` and
+    /// the same grouping identity the `Json` fallback would: `Int` re-wraps
+    /// through `Value::from(i64)`, `Float` keys on `to_bits`, which the fallback's
+    /// shortest-roundtrip string matches, and `Str` clones the same string. An
+    /// out-of-range `u64` is `Kind::Other` in `kind_of`, so no arm can silently
+    /// null a value the fallback would have kept.
     ///
     /// A grouped read touches exactly one property, so columnarizing the rest is
     /// pure waste: over entities carrying thirty properties it decoded and built
-    /// thirty columns to use one, once per group-by expression. `None` keeps every
-    /// property, which is what the shared whole-graph build needs.
+    /// thirty columns to use one, once per group-by expression.
     pub(crate) fn from_items_for(items: Vec<(S::Id, Value)>, only: Option<&str>) -> Self {
         let n = items.len();
-        let mut dense_to_id = Vec::with_capacity(n);
-        let mut id_to_dense: AHashMap<S::Id, u32> = AHashMap::with_capacity(n);
-        for (i, (id, _)) in items.iter().enumerate() {
-            dense_to_id.push(*id);
-            id_to_dense.insert(*id, i as u32);
-        }
+        let dense_to_id: Vec<S::Id> = items.iter().map(|(id, _)| *id).collect();
+        let id_to_dense = crate::csr::DenseIndex::from_ids(&dense_to_id);
 
-        let mut values: AHashMap<String, Vec<Option<Value>>> = AHashMap::new();
+        let mut builders: AHashMap<String, ColumnBuilder> = AHashMap::new();
         for (dense, (_, json)) in items.into_iter().enumerate() {
             if let Value::Object(map) = json {
                 for (k, v) in map {
                     if only.is_some_and(|want| want != k) {
                         continue;
                     }
-                    let col = values.entry(k).or_insert_with(|| vec![None; n]);
-                    col[dense] = Some(v);
+                    builders
+                        .entry(k)
+                        .or_insert_with(ColumnBuilder::new)
+                        .push(dense, v);
                 }
             }
         }
-        let cols: AHashMap<String, PropColumn> = values
+        let cols: AHashMap<String, PropColumn> = builders
             .into_iter()
-            .map(|(k, v)| (k, PropColumn::from_values(v)))
+            .map(|(k, b)| (k, b.finish(n)))
             .collect();
         Self {
             id_to_dense,
-            dense_to_id,
+            dense_to_id: dense_to_id.into(),
             cols,
             stats: AHashMap::new(),
+            bounds: AHashMap::new(),
         }
     }
 
@@ -606,6 +846,18 @@ impl<S: ColumnSource> PropColumns<S> {
             self.stats.insert(prop.to_string(), computed);
         }
         self.stats.get(prop).and_then(|s| s.as_ref())
+    }
+
+    /// The smallest and largest non-null value of `prop`, by one pass over the
+    /// column, cached until the next patch. `None` for a missing property, the
+    /// `Json` fallback, or an all-null column; the same cases `prop_stats`
+    /// declines.
+    pub(crate) fn min_max(&mut self, prop: &str) -> Option<(Value, Value)> {
+        if !self.bounds.contains_key(prop) {
+            let computed = self.cols.get(prop).and_then(column_bounds);
+            self.bounds.insert(prop.to_string(), computed);
+        }
+        self.bounds.get(prop).and_then(|b| b.clone())
     }
 
     /// Gather `props` for each id in `ids`, row-major: `out[i][j]` is the
@@ -621,7 +873,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let cols: Vec<Option<&PropColumn>> = props.iter().map(|p| self.cols.get(*p)).collect();
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+            let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 cols.iter()
                     .map(|c| c.and_then(|c| c.get_json_opt(dense)).unwrap_or(Value::Null))
@@ -641,7 +893,7 @@ impl<S: ColumnSource> PropColumns<S> {
         let col = self.cols.get(prop);
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
-            let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+            let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
             out.push(
                 col.and_then(|c| c.get_json_opt(dense))
                     .unwrap_or(Value::Null),
@@ -702,9 +954,8 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Int(v) => {
                 let mut seen: AHashMap<i64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
-                    codes.push(match v[dense] {
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
                         Some(n) => *seen.entry(n).or_insert_with(|| {
                             reps.push(Value::from(n));
@@ -719,9 +970,8 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity is serialization identity.
                 let mut seen: AHashMap<u64, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
-                    codes.push(match v[dense] {
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
                         Some(f) => *seen.entry(f.to_bits()).or_insert_with(|| {
                             reps.push(Value::from(f));
@@ -733,29 +983,27 @@ impl<S: ColumnSource> PropColumns<S> {
             PropColumn::Bool(v) => {
                 let mut seen: [Option<u32>; 2] = [None, None];
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
-                    codes.push(match v[dense] {
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    codes.push(match v.get(dense) {
                         None => intern_null(&mut reps),
-                        Some(b) => *seen[b as usize].get_or_insert_with(|| {
-                            reps.push(Value::from(b));
+                        Some(b) => *seen[(b != 0) as usize].get_or_insert_with(|| {
+                            reps.push(Value::Bool(b != 0));
                             (reps.len() - 1) as u32
                         }),
                     });
                 }
             }
-            PropColumn::Str { dict, idx, .. } => {
+            PropColumn::Str { dict, idx } => {
                 // The dictionary index is already a dense value identity; the
                 // per-row work is two array reads.
                 let mut dict_code: Vec<u32> = vec![u32::MAX; dict.len()];
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match idx[dense] {
                         STR_NULL => intern_null(&mut reps),
                         i => {
                             if dict_code[i as usize] == u32::MAX {
-                                reps.push(Value::String(dict[i as usize].clone()));
+                                reps.push(Value::String(dict.get(i as usize).to_owned()));
                                 dict_code[i as usize] = (reps.len() - 1) as u32;
                             }
                             dict_code[i as usize]
@@ -768,8 +1016,7 @@ impl<S: ColumnSource> PropColumns<S> {
                 // identity the executor's string-keyed fold uses.
                 let mut seen: AHashMap<String, u32> = AHashMap::with_capacity(seen_capacity);
                 for &id in ids {
-                    let dense =
-                        *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                    let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                     codes.push(match &v[dense] {
                         None => intern_null(&mut reps),
                         Some(val) => *seen.entry(val.to_string()).or_insert_with(|| {
@@ -835,7 +1082,7 @@ impl<S: ColumnSource> PropColumns<S> {
         };
 
         let dense_of = |id: S::Id| -> Result<usize, Error> {
-            Ok(*self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize)
+            Ok(self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize)
         };
 
         let mask = match col {
@@ -843,20 +1090,20 @@ impl<S: ColumnSource> PropColumns<S> {
                 Value::Number(n) => {
                     if let Some(c) = n.as_i64() {
                         ids.iter()
-                            .map(|&id| Ok(v[dense_of(id)?].is_some_and(|x| keeps(x.cmp(&c)))))
+                            .map(|&id| Ok(v.get(dense_of(id)?).is_some_and(|x| keeps(x.cmp(&c)))))
                             .collect::<Result<Vec<bool>, Error>>()?
                     } else if let Some(c) = n.as_f64() {
                         ids.iter()
                             .map(|&id| {
-                                Ok(v[dense_of(id)?]
+                                Ok(v.get(dense_of(id)?)
                                     .is_some_and(|x| (x as f64).partial_cmp(&c).is_some_and(keeps)))
                             })
                             .collect::<Result<Vec<bool>, Error>>()?
                     } else {
-                        self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?
+                        self.presence_mask(ids, |d| v.is_some(d), mismatch_keeps)?
                     }
                 }
-                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+                _ => self.presence_mask(ids, |d| v.is_some(d), mismatch_keeps)?,
             },
             PropColumn::Float(v) => match rhs {
                 // `as_f64` is how the boxed comparison reads either numeric
@@ -865,28 +1112,28 @@ impl<S: ColumnSource> PropColumns<S> {
                     if let Some(c) = n.as_f64() {
                         ids.iter()
                             .map(|&id| {
-                                Ok(v[dense_of(id)?]
+                                Ok(v.get(dense_of(id)?)
                                     .is_some_and(|x| x.partial_cmp(&c).is_some_and(keeps)))
                             })
                             .collect::<Result<Vec<bool>, Error>>()?
                     } else {
-                        self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?
+                        self.presence_mask(ids, |d| v.is_some(d), mismatch_keeps)?
                     }
                 }
-                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+                _ => self.presence_mask(ids, |d| v.is_some(d), mismatch_keeps)?,
             },
             PropColumn::Bool(v) => match rhs {
                 Value::Bool(c) => ids
                     .iter()
-                    .map(|&id| Ok(v[dense_of(id)?].is_some_and(|x| keeps(x.cmp(c)))))
+                    .map(|&id| Ok(v.get(dense_of(id)?).is_some_and(|x| keeps((x != 0).cmp(c)))))
                     .collect::<Result<Vec<bool>, Error>>()?,
-                _ => self.presence_mask(ids, |d| v[d].is_some(), mismatch_keeps)?,
+                _ => self.presence_mask(ids, |d| v.is_some(d), mismatch_keeps)?,
             },
-            PropColumn::Str { dict, idx, .. } => match rhs {
+            PropColumn::Str { dict, idx } => match rhs {
                 Value::String(c) => {
                     // One comparison per distinct dictionary entry, one array
                     // read per row.
-                    let pass: Vec<bool> = dict.iter().map(|s| keeps(s.as_str().cmp(c))).collect();
+                    let pass: Vec<bool> = dict.iter().map(|s| keeps(s.cmp(c.as_str()))).collect();
                     ids.iter()
                         .map(|&id| {
                             Ok(match idx[dense_of(id)?] {
@@ -913,7 +1160,7 @@ impl<S: ColumnSource> PropColumns<S> {
     ) -> Result<Vec<bool>, Error> {
         ids.iter()
             .map(|&id| {
-                let dense = *self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
+                let dense = self.id_to_dense.get(&id).ok_or_else(|| S::not_found(id))? as usize;
                 Ok(keeps && present(dense))
             })
             .collect()
@@ -927,6 +1174,7 @@ impl<S: ColumnSource> PropColumns<S> {
         // including ones whose property the new records no longer carry.
         if !touched.is_empty() {
             self.stats.clear();
+            self.bounds.clear();
         }
         // Read in chunks, not all at once. One transaction per entity would charge
         // the next refresh a begin/end pair for each, but one gather over the whole
@@ -944,11 +1192,11 @@ impl<S: ColumnSource> PropColumns<S> {
                     None => continue,
                 };
                 let dense = match self.id_to_dense.get(&id) {
-                    Some(&d) => d as usize,
+                    Some(d) => d as usize,
                     None => {
                         let d = self.dense_to_id.len();
-                        self.dense_to_id.push(id);
-                        self.id_to_dense.insert(id, d as u32);
+                        self.dense_to_id.with_mut(|v| v.push(id));
+                        self.id_to_dense.push(id);
                         d
                     }
                 };
@@ -978,7 +1226,7 @@ impl<S: ColumnSource> PropColumns<S> {
 /// whose mixed kinds have no total order to summarize.
 fn sorted_non_null_values(col: &PropColumn) -> Option<Vec<Value>> {
     let mut vals: Vec<Value> = match col {
-        PropColumn::Int(v) => v.iter().flatten().map(|&x| Value::from(x)).collect(),
+        PropColumn::Int(v) => v.iter().flatten().map(Value::from).collect(),
         // NaN is excluded: it is unordered, and a NaN cell fails every
         // comparison the estimates model, so leaving it out keeps bounds
         // and histogram mass conservative.
@@ -986,13 +1234,13 @@ fn sorted_non_null_values(col: &PropColumn) -> Option<Vec<Value>> {
             .iter()
             .flatten()
             .filter(|x| !x.is_nan())
-            .map(|&x| Value::from(x))
+            .map(Value::from)
             .collect(),
-        PropColumn::Bool(v) => v.iter().flatten().map(|&x| Value::Bool(x)).collect(),
-        PropColumn::Str { dict, idx, .. } => idx
+        PropColumn::Bool(v) => v.iter().flatten().map(|x| Value::Bool(x != 0)).collect(),
+        PropColumn::Str { dict, idx } => idx
             .iter()
             .filter(|&&i| i != STR_NULL)
-            .map(|&i| Value::String(dict[i as usize].clone()))
+            .map(|&i| Value::String(dict.get(i as usize).to_owned()))
             .collect(),
         PropColumn::Json(_) => return None,
     };
@@ -1002,12 +1250,47 @@ fn sorted_non_null_values(col: &PropColumn) -> Option<Vec<Value>> {
     Some(vals)
 }
 
+/// The bounds of a typed column's non-null values in one pass. A `Float` NaN
+/// is skipped as `sorted_non_null_values` skips it.
+fn column_bounds(col: &PropColumn) -> Option<(Value, Value)> {
+    fn fold<T: Copy + PartialOrd>(it: impl Iterator<Item = T>) -> Option<(T, T)> {
+        it.fold(None, |acc, x| match acc {
+            None => Some((x, x)),
+            Some((lo, hi)) => Some((if x < lo { x } else { lo }, if x > hi { x } else { hi })),
+        })
+    }
+    match col {
+        PropColumn::Int(v) => {
+            fold(v.iter().flatten()).map(|(a, b)| (Value::from(a), Value::from(b)))
+        }
+        PropColumn::Float(v) => fold(v.iter().flatten().filter(|x| !x.is_nan()))
+            .map(|(a, b)| (Value::from(a), Value::from(b))),
+        PropColumn::Bool(v) => {
+            fold(v.iter().flatten()).map(|(a, b)| (Value::Bool(a != 0), Value::Bool(b != 0)))
+        }
+        PropColumn::Str { dict, idx } => {
+            let mut lo: Option<&str> = None;
+            let mut hi: Option<&str> = None;
+            for &i in idx.iter().filter(|&&i| i != STR_NULL) {
+                let s = dict.get(i as usize);
+                if lo.is_none_or(|l| s < l) {
+                    lo = Some(s);
+                }
+                if hi.is_none_or(|h| s > h) {
+                    hi = Some(s);
+                }
+            }
+            Some((Value::String(lo?.to_owned()), Value::String(hi?.to_owned())))
+        }
+        PropColumn::Json(_) => None,
+    }
+}
+
 fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
     let vals = sorted_non_null_values(col)?;
-    let (min, max) = match (vals.first(), vals.last()) {
-        (Some(mn), Some(mx)) => (mn.clone(), mx.clone()),
-        _ => return None,
-    };
+    if vals.is_empty() {
+        return None;
+    }
     let histogram = crate::histogram::Histogram::build(&vals, HISTOGRAM_BUCKETS);
 
     let mut runs: Vec<(Value, u64)> = Vec::new();
@@ -1023,8 +1306,6 @@ fn compute_prop_stats(col: &PropColumn) -> Option<PropStats> {
     runs.truncate(MCV_LIMIT);
 
     Some(PropStats {
-        min,
-        max,
         histogram,
         mcvs: runs,
     })

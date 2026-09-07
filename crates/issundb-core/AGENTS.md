@@ -76,6 +76,18 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   ```
 
 - Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
+- A `WriteTxn` batches its bookkeeping in `WriteBatchCache` and writes it just before the commit, in the same transaction. The next node and edge
+  ids are read from `meta` once and handed out from memory, and the per-label and per-type counts accumulate as deltas; both were a `meta` read and
+  write per record, a sixth of a bulk load. Every allocation and count change inside a `WriteTxn` must go through the cache (the `_inner` forms of
+  the node and edge writers take it): an allocation straight from `meta` beside the cached counter hands out an id twice, and a direct count
+  adjustment is clamped at zero against a stored count that has not absorbed the batch's additions. `WriteTxn::node_count_by_label` and
+  `edge_count_by_type` add the pending deltas, so a count read inside the transaction sees its own writes.
+- `WriteTxn::begin_bulk_load` (used by `COPY ... FROM` and `IMPORT DATABASE`) additionally buffers the adjacency entries and writes each direction
+  sorted by node id and duplicate order, in chunks of `ADJ_FLUSH_THRESHOLD` and at commit, through one cursor per direction
+  (`storage::put_sorted_duplicates`, one of the two backend-specific helpers beside the table aliases): LMDB descends from the root on every plain
+  `put`, and a positioned cursor whose next key lands on the same leaf skips that descent. One random `in_adj` put per edge dirtied a B-tree leaf per edge, and past a
+  few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
+  stored entries in store order, and a deletion flushes the buffer before it walks the stores.
 
 ## Thread Count
 
@@ -101,10 +113,17 @@ caller's thread with `resume_unwind` rather than converted to an `Error`: `Corru
 
 ## CSR Snapshot Vs. LMDB Adjacency
 
-`CsrSnapshot` (in `csr.rs`) is a read-only in-memory Compressed Sparse Row view of the adjacency: the outgoing arrays plus a transposed incoming view
-carrying per-edge type and edge ids, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. It is the only in-memory
+`CsrSnapshot` (in `csr.rs`) is a read-only Compressed Sparse Row view of the adjacency: the outgoing arrays (destination, type, and edge id per
+entry) plus a transposed incoming view, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. It is the only in-memory
 adjacency structure, and every algorithm kernel in `graph/kernels/` reads it, bar `label_propagation`, which walks storage per node and is noted as the
 exception in that module's header.
+
+Every array is an `Array<T>` (`array.rs`): a `Vec` when the snapshot was built or patched in this process, a view into the memory-mapped cache file
+when it was loaded. Both dereference to `&[T]`, so a kernel indexes them the same way. `id_to_dense` is a `DenseIndex`: table-free when the node ids
+run without gaps (dense index = id minus the first id, which every bulk-loaded graph has), a hash map otherwise. A whole-label mask over two million
+nodes went from 60 ms of hash probes to 2 ms of subtractions, and a loaded contiguous snapshot owns no heap at all. The
+mapped pages are the page cache's: shared between processes, evictable under pressure, and resident only where a query has read. Mutation goes through
+`Array::with_mut`, which copies a mapped view onto the heap first; nothing ever writes through a mapping.
 
 It is built at the smallest size its consumers read, and the build is memory-shaped in ways that are easy to undo by accident:
 
@@ -119,6 +138,12 @@ It is built at the smallest size its consumers read, and the build is memory-sha
   proptest pinning every array, incoming included, against the builder this replaced. The pass is a consequence of the stored layout: putting `edge_id`
   first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
   the order `out_neighbors` returns.
+- The incoming view carries its own type array (`in_edge_type`, a sequential read for a typed incoming scan) but no id array: `in_pos[k]` is the
+  outgoing position of the k-th incoming entry, so its id is `edge_id[in_pos[k]]`, four bytes per edge in place of eight, and only a rel-binding
+  expansion in the incoming direction reads it. Reading the type through `in_pos` was tried and doubled the two-hop count kernel's time (a random
+  read per incoming edge), and tallying typed in-degrees over the outgoing arrays was slower still (a scattered write per edge); do not remove
+  `in_edge_type`. `typed_neighbor_counts` does use the outgoing tally for a bulk incoming source set, where it was measured to win. The 32-bit
+  position caps a snapshot at `MAX_SNAPSHOT_EDGES`; a build past it is `Error::InvalidArgument`.
 - `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
   `shortest_path_dijkstra` is its only reader. Asking for it is sticky (`CsrCache::request_weights`), so a later unweighted refresh does not strip it out
   from under an alternating workload; the cost is eight bytes per edge held once anything asks a weighted question. Requesting Dijkstra against a
@@ -144,12 +169,17 @@ them against a build from storage after every refresh: a change is recorded befo
 every batch the counter accounts for; a patched row keeps ascending edge-id order (appended ids are normally larger, and a row is re-sorted otherwise);
 and a node id that does not sort after every existing one declines the patch, because dense indices are the rank of ascending node ids.
 
-A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` loads the flat arrays sequentially when the file
-carries this database's identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and its persisted commit generation
+A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` maps the file (`memmap2`) and points the
+arrays into it, after verifying the checksum over the whole file in one sequential pass, when the file carries this database's identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and its persisted commit generation
 (`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage, and falls through to the scan
 on any mismatch, truncation, oversized length claim, or checksum failure. The identity is what refuses a file another database left behind at a
 coincidentally matching generation, which a restore into a directory with leftover cache files would otherwise serve; `restore_from_file` also removes
-such leftovers. `Graph::rebuild_csr` is the only save site, chosen because every bulk load ends there, and it always builds from storage rather than
+such leftovers. The arrays sit at 8-byte-aligned offsets in a fixed order, which is what makes the mapping possible; a host that is not 64-bit
+little-endian refuses the file and builds from storage. A save writes a temporary file and renames it into place, so a live mapping keeps serving the
+inode it opened. On Windows that rename is refused while a mapping is alive, so `publish_cache_file` moves the old file aside first and deletes it
+when the mapping allows; `Graph::open` removes any `.cache.old-*` file a previous process could not. The refresh's
+`with_additions` copies a mapped snapshot's rows into owned arrays, the copy-on-write the `Array` type exists for. `Graph::rebuild_csr` is the only
+save site, chosen because every bulk load ends there, and it always builds from storage rather than
 loading the file it is about to overwrite, or a wrong file could never be repaired; the gate's per-write refreshes never write a file. The generation is
 captured before a build or save, so a write landing mid-pass leaves the result conservatively stale rather than falsely fresh. The cache file changes
 where a full build's bytes come from and nothing about the within-process freshness rules.
@@ -179,10 +209,18 @@ where a full build's bytes come from and nothing about the within-process freshn
 It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-first rule.
 
 - `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
-  `id -> index` map. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
+  `id -> index` mapping, the same `DenseIndex` the CSR snapshot uses: a subtraction when the entity ids run without gaps, a hash map otherwise.
+  Replacing the hash map cut the per-row cost of every bulk gather and comparison mask; the four-hop chains in the benchmark dropped from 185 ms to
+  27 ms at 2M persons with this and the cached label bitmap together. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
   `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
 - A column is `Int`, `Float`, `Bool`, a dictionary-encoded `Str`, or the exact-semantics `Json` fallback, and single-property reads come through
-  `Graph::node_prop_json`. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
+  `Graph::node_prop_json`. The typed variants are plain arrays behind `Array<T>` (see the CSR section): `Nullable<T>` is a presence bitmap beside a
+  value array (nine bits of tag per eight bytes of value, where `Vec<Option<i64>>` doubled the slot), `Bool` stores a byte per slot, and `StrDict` is an
+  offsets array over one byte run with its interning map derived on the first intern rather than stored. Only `Json` lives on the heap unconditionally.
+- The whole-graph build streams: `ColumnSource::for_each` hands each entity's decoded properties to the per-property `ColumnBuilder`s and drops them
+  before the next entity is read. Do not reintroduce a collect-everything scan (the old `scan_all`); holding every entity's `Value` until the end
+  peaked at three times the finished columns' size on a million-node graph. A builder picks the tightest kind from the first non-null value and
+  degrades to `Json` at the first value of another kind, exactly as a patch does. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
   beside the columns and invalidated by the same post-commit patch.
 - `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
   request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent
@@ -205,8 +243,12 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
   and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
 - A full build tries the columns cache file first (`cache_file.rs`, `lmdb` feature only), generation-checked the same way the CSR cache file is;
   `Graph::materialize_property_columns` is the node columns' save site, `Graph::materialize_edge_property_columns` the edge columns', and a repeat at
-  an unchanged generation skips the rewrite. The cache file skips each string column's interning map and the statistics, both derivable;
-  `PropColumn::rebuild_lookup` restores the former on load.
+  an unchanged generation skips the rewrite. The file is a directory of columns followed by their arrays at 8-byte-aligned offsets, and a load maps
+  it: each typed column becomes a view of the file, so a property no query reads never becomes resident, and the first patch copies just the touched
+  columns onto the heap. That is the per-property laziness; there is deliberately no per-property build from storage, because one streaming scan
+  builds every column for the price of decoding each record once, where a scan per property would decode them once per property. A `Json` column
+  is decoded onto the heap at load. The file skips the string interning maps and the statistics, both derivable. The checksum is verified over the
+  whole file before anything is served, one sequential read.
 - `Graph::nodes_prop_cmp_mask` is the typed predicate evaluation over these columns: a comparison filter's per-row outcome computed against the native
   column storage, declining (`Ok(None)`) on a small cold request or a `Json` column so the caller falls back to boxed comparison. Its semantics are
   pinned by `typed_cmp_mask_follows_cypher_scalar_semantics`; change that test only together with the boxed comparison it mirrors.

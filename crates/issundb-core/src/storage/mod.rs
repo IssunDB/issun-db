@@ -27,6 +27,6 @@ pub mod lmdb;
 pub mod memory;
 
 #[cfg(feature = "lmdb")]
-pub(crate) use lmdb::{OwnedRoTxn, RoTxn, RwTxn, Storage, StorageError};
+pub(crate) use lmdb::{OwnedRoTxn, RoTxn, RwTxn, Storage, StorageError, put_sorted_duplicates};
 #[cfg(not(feature = "lmdb"))]
-pub(crate) use memory::{OwnedRoTxn, RoTxn, RwTxn, Storage, StorageError};
+pub(crate) use memory::{OwnedRoTxn, RoTxn, RwTxn, Storage, StorageError, put_sorted_duplicates};

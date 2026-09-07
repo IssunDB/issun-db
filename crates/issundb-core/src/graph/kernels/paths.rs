@@ -83,7 +83,7 @@ impl Graph {
             return Ok(Some(vec![src]));
         }
         self.with_snapshot(|snap| {
-            let (Some(&src_dense), Some(&dst_dense)) =
+            let (Some(src_dense), Some(dst_dense)) =
                 (snap.id_to_dense.get(&src), snap.id_to_dense.get(&dst))
             else {
                 return Ok(None);
@@ -100,7 +100,7 @@ impl Graph {
                 let cur_level = levels[cur as usize];
                 let mut moved = false;
                 for ne in self.adj_entries(snap.dense_to_id[cur as usize], false)? {
-                    if let Some(&pred) = snap.id_to_dense.get(&ne.node) {
+                    if let Some(pred) = snap.id_to_dense.get(&ne.node) {
                         if levels[pred as usize] == cur_level - 1 {
                             path.push(pred);
                             cur = pred;
@@ -160,7 +160,7 @@ impl Graph {
         })?;
 
         let n = snap.dense_to_id.len();
-        let (Some(&src_dense), Some(&dst_dense)) =
+        let (Some(src_dense), Some(dst_dense)) =
             (snap.id_to_dense.get(&src), snap.id_to_dense.get(&dst))
         else {
             return Ok(None);
@@ -261,7 +261,7 @@ impl Graph {
             let cur_dist = dist[cur as usize];
             let mut moved = false;
             for ne in self.adj_entries(snap.dense_to_id[cur as usize], false)? {
-                let Some(&pred) = snap.id_to_dense.get(&ne.node) else {
+                let Some(pred) = snap.id_to_dense.get(&ne.node) else {
                     continue;
                 };
                 let pred_dist = dist[pred as usize];
@@ -338,8 +338,8 @@ impl Graph {
 
             if depth < max_depth {
                 if let Some(dense) = snap.id_to_dense.get(&node) {
-                    let start_idx = snap.row_ptr[*dense as usize];
-                    let end_idx = snap.row_ptr[*dense as usize + 1];
+                    let start_idx = snap.row_ptr[dense as usize];
+                    let end_idx = snap.row_ptr[dense as usize + 1];
                     for k in start_idx..end_idx {
                         let neighbor = snap.dense_to_id[snap.col_idx[k] as usize];
                         dfs_recurse(snap, neighbor, depth + 1, max_depth, best_depth, order);
@@ -438,7 +438,7 @@ impl Graph {
             emit(&[src]);
             return;
         }
-        let Some(&src_dense) = snap.id_to_dense.get(&src) else {
+        let Some(src_dense) = snap.id_to_dense.get(&src) else {
             return;
         };
 
@@ -491,7 +491,7 @@ impl Graph {
             return Ok(vec![vec![src]]);
         }
 
-        let (Some(&src_dense), Some(&dst_dense)) =
+        let (Some(src_dense), Some(dst_dense)) =
             (snap.id_to_dense.get(&src), snap.id_to_dense.get(&dst))
         else {
             return Ok(vec![]);
@@ -522,7 +522,7 @@ impl Graph {
         //   by two relationship types is separated by every entry whose type sorts
         //   between them.
         let admissible = |node: NodeId| -> Result<Vec<NodeId>, Error> {
-            let Some(&dense) = snap.id_to_dense.get(&node) else {
+            let Some(dense) = snap.id_to_dense.get(&node) else {
                 return Ok(Vec::new());
             };
             let cur_level = levels[dense as usize];
@@ -532,7 +532,7 @@ impl Graph {
             let mut seen: AHashSet<NodeId> = AHashSet::new();
             let mut preds = Vec::new();
             for ne in self.adj_entries(node, false)? {
-                if let Some(&pred) = snap.id_to_dense.get(&ne.node) {
+                if let Some(pred) = snap.id_to_dense.get(&ne.node) {
                     if levels[pred as usize] == cur_level - 1 && seen.insert(ne.node) {
                         preds.push(ne.node);
                     }
@@ -625,7 +625,7 @@ impl Graph {
                     continue;
                 }
 
-                if let Some(&node_dense) = snap.id_to_dense.get(&node) {
+                if let Some(node_dense) = snap.id_to_dense.get(&node) {
                     let start = snap.row_ptr[node_dense as usize];
                     let end = snap.row_ptr[node_dense as usize + 1];
                     for k in start..end {
@@ -712,7 +712,7 @@ impl Graph {
                         let u = root_path[m_idx];
                         let v = root_path[m_idx + 1];
                         let mut min_w = f64::INFINITY;
-                        if let Some(&u_dense) = snap.id_to_dense.get(&u) {
+                        if let Some(u_dense) = snap.id_to_dense.get(&u) {
                             let start = snap.row_ptr[u_dense as usize];
                             let end = snap.row_ptr[u_dense as usize + 1];
                             for k_idx in start..end {

@@ -7,6 +7,7 @@ use ahash::AHashMap;
 use arc_swap::ArcSwap;
 
 use crate::{
+    array::Array,
     error::Error,
     schema::{AdjEntry, EdgeId, EdgeRecord, NodeId, TypeId},
     storage::{Storage, props},
@@ -16,12 +17,18 @@ use crate::{
 pub const REBUILD_THRESHOLD: u64 = 1_000;
 
 /// Compressed Sparse Row snapshot of the adjacency (outgoing and incoming).
+///
+/// Every array is an [`Array`]: owned when the snapshot was built or patched in
+/// this process, a view into the mapped cache file when it was loaded. The
+/// kernels index them as slices either way, so a loaded snapshot costs heap for
+/// nothing but `id_to_dense`, and only the pages a query touches become
+/// resident.
 pub struct CsrSnapshot {
     /// `row_ptr[i]..row_ptr[i+1]` is the range of the i-th node's edges.
-    pub row_ptr: Vec<usize>,
-    pub col_idx: Vec<u32>,
-    pub edge_type: Vec<TypeId>,
-    pub edge_id: Vec<EdgeId>,
+    pub row_ptr: Array<usize>,
+    pub col_idx: Array<u32>,
+    pub edge_type: Array<TypeId>,
+    pub edge_id: Array<EdgeId>,
     /// Per-entry edge weight, parallel to `col_idx`, present only on a snapshot
     /// built by [`CsrSnapshot::build_weighted`].
     ///
@@ -31,7 +38,7 @@ pub struct CsrSnapshot {
     /// edge for the life of the snapshot, so a workload that never asks a weighted
     /// question must not pay it. [`CsrCache::request_weights`] is how a consumer
     /// asks.
-    pub edge_weight: Option<Vec<f64>>,
+    pub edge_weight: Option<Array<f64>>,
     /// Whether any entry of `edge_weight` is negative, decided once at build time.
     ///
     /// Dijkstra's heap relaxation needs non-negative weights and falls back to a
@@ -42,12 +49,138 @@ pub struct CsrSnapshot {
     /// Transpose of the outgoing CSR: `in_row_ptr[i]..in_row_ptr[i+1]` ranges
     /// over the i-th node's incoming edges, `in_col_idx` holds source dense
     /// indices, and entries within a row are ordered by ascending source.
-    pub in_row_ptr: Vec<usize>,
-    pub in_col_idx: Vec<u32>,
-    pub in_edge_type: Vec<TypeId>,
-    pub in_edge_id: Vec<EdgeId>,
-    pub dense_to_id: Vec<NodeId>,
-    pub id_to_dense: AHashMap<NodeId, u32>,
+    pub in_row_ptr: Array<usize>,
+    pub in_col_idx: Array<u32>,
+    /// The type of each incoming entry, duplicated from the outgoing arrays so
+    /// that a typed scan of an incoming row is one sequential read; reading it
+    /// through `in_pos` instead costs a random read per entry, which doubled the
+    /// two-hop count kernel's time.
+    pub in_edge_type: Array<TypeId>,
+    /// For each incoming entry, the position of the same edge in the outgoing
+    /// arrays, so its id is `edge_id[in_pos[k]]`. Four bytes per edge in place
+    /// of a duplicated eight-byte id; only a rel-binding expansion in the
+    /// incoming direction reads it, one random read per emitted edge.
+    pub in_pos: Array<u32>,
+    pub dense_to_id: Array<NodeId>,
+    pub id_to_dense: DenseIndex,
+}
+
+/// The largest number of edges a snapshot can hold: `in_pos` addresses the
+/// outgoing arrays with 32 bits.
+pub const MAX_SNAPSHOT_EDGES: usize = u32::MAX as usize;
+
+/// Node id to dense index, the inverse of `dense_to_id`.
+///
+/// Every bulk-loaded graph allocates its node ids without gaps, so the dense
+/// index of an id is the id's offset from the first one and no table is
+/// needed: the lookup is a subtraction and a bounds check, and a loaded
+/// snapshot owns no heap for it at all. A graph with deleted nodes (or one
+/// that never had contiguous ids) falls back to the hash map, which was the
+/// only representation before and costs a probe per lookup plus tens of
+/// megabytes per million nodes.
+#[derive(Debug, Clone)]
+pub enum DenseIndex {
+    /// `dense_to_id[d] == first + d` for every `d < n`.
+    Contiguous {
+        first: NodeId,
+        n: u32,
+    },
+    Map(AHashMap<NodeId, u32>),
+}
+
+impl DenseIndex {
+    /// The index of `dense_to_id`, which must hold distinct ids (a snapshot's
+    /// node array always does). Contiguous when `dense_to_id[d] == first + d`
+    /// for every slot, whatever the array's order otherwise.
+    pub fn from_sorted(dense_to_id: &[NodeId]) -> Self {
+        Self::from_ids(dense_to_id)
+    }
+
+    /// [`DenseIndex::from_sorted`] under its general name; the property
+    /// columns index entities in storage order, which is the same test.
+    pub fn from_ids(dense_to_id: &[NodeId]) -> Self {
+        let n = dense_to_id.len();
+        if n <= u32::MAX as usize {
+            let first = dense_to_id.first().copied().unwrap_or(0);
+            if dense_to_id
+                .iter()
+                .enumerate()
+                .all(|(d, &id)| id == first.wrapping_add(d as u64))
+            {
+                return Self::Contiguous { first, n: n as u32 };
+            }
+        }
+        Self::Map(
+            dense_to_id
+                .iter()
+                .enumerate()
+                .map(|(d, &id)| (id, d as u32))
+                .collect(),
+        )
+    }
+
+    /// Record that `id` now has dense index `len()`. The contiguous form
+    /// survives when `id` continues the run; otherwise the index becomes a map.
+    pub fn push(&mut self, id: NodeId) {
+        let dense = self.len() as u32;
+        match self {
+            Self::Contiguous { first, n } if *first + *n as u64 == id && *n < u32::MAX => {
+                *n += 1;
+            }
+            Self::Contiguous { first, n } => {
+                let mut map: AHashMap<NodeId, u32> =
+                    (0..*n).map(|d| (*first + d as u64, d)).collect();
+                map.insert(id, dense);
+                *self = Self::Map(map);
+            }
+            Self::Map(map) => {
+                map.insert(id, dense);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, id: &NodeId) -> Option<u32> {
+        match self {
+            Self::Contiguous { first, n } => {
+                let offset = id.checked_sub(*first)?;
+                (offset < *n as u64).then_some(offset as u32)
+            }
+            Self::Map(map) => map.get(id).copied(),
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, id: &NodeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Contiguous { n, .. } => *n as usize,
+            Self::Map(map) => map.len(),
+        }
+    }
+
+    /// Whether this is the table-free representation.
+    #[cfg(test)]
+    pub fn is_contiguous(&self) -> bool {
+        matches!(self, Self::Contiguous { .. })
+    }
+}
+
+impl PartialEq for DenseIndex {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Contiguous { first, n }, Self::Contiguous { first: f2, n: n2 }) => {
+                first == f2 && n == n2
+            }
+            (Self::Map(a), Self::Map(b)) => a == b,
+            (Self::Map(map), other) | (other, Self::Map(map)) => {
+                map.len() == other.len() && map.iter().all(|(id, &d)| other.get(id) == Some(d))
+            }
+        }
+    }
 }
 
 impl CsrSnapshot {
@@ -56,19 +189,26 @@ impl CsrSnapshot {
     /// tests that need a snapshot without a storage environment.
     pub fn empty() -> Self {
         Self {
-            row_ptr: vec![0],
-            col_idx: vec![],
-            edge_type: vec![],
-            edge_id: vec![],
+            row_ptr: vec![0].into(),
+            col_idx: Array::default(),
+            edge_type: Array::default(),
+            edge_id: Array::default(),
             edge_weight: None,
             has_negative_weight: false,
-            in_row_ptr: vec![0],
-            in_col_idx: vec![],
-            in_edge_type: vec![],
-            in_edge_id: vec![],
-            dense_to_id: vec![],
-            id_to_dense: AHashMap::new(),
+            in_row_ptr: vec![0].into(),
+            in_col_idx: Array::default(),
+            in_edge_type: Array::default(),
+            in_pos: Array::default(),
+            dense_to_id: Array::default(),
+            id_to_dense: DenseIndex::from_sorted(&[]),
         }
+    }
+
+    /// The error for an edge count `in_pos` cannot address.
+    fn too_many_edges(total: usize) -> Error {
+        Error::InvalidArgument(format!(
+            "the adjacency holds {total} edges, more than the {MAX_SNAPSHOT_EDGES} a snapshot can index"
+        ))
     }
 
     /// Build a fresh in-RAM snapshot of the adjacency, without edge weights.
@@ -118,11 +258,7 @@ impl CsrSnapshot {
         dense_to_id.sort_unstable();
 
         let n = dense_to_id.len();
-        let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect();
+        let id_to_dense = DenseIndex::from_sorted(&dense_to_id);
 
         // One pass over `out_adj`. Keys ascend by node id and the dense index is
         // the rank in that same order, so the entries arrive grouped by ascending
@@ -144,7 +280,7 @@ impl CsrSnapshot {
             // of one node arrive consecutively.
             if cached_src != Some(src) {
                 cached_src = Some(src);
-                src_dense = id_to_dense.get(&src).copied();
+                src_dense = id_to_dense.get(&src);
             }
             // An endpoint with no record in `nodes` has no dense index, so its
             // entries are skipped, exactly as the previous builder skipped an edge
@@ -155,7 +291,7 @@ impl CsrSnapshot {
             // Copied out before use: `AdjEntry` is `repr(packed)`, so a field
             // cannot be borrowed.
             let dst = entry.other;
-            let Some(&dst_d) = id_to_dense.get(&dst) else {
+            let Some(dst_d) = id_to_dense.get(&dst) else {
                 continue;
             };
             row_ptr[src_d as usize + 1] += 1;
@@ -168,6 +304,9 @@ impl CsrSnapshot {
         }
         let total = row_ptr[n];
         debug_assert_eq!(total, col_idx.len());
+        if total > MAX_SNAPSHOT_EDGES {
+            return Err(Self::too_many_edges(total));
+        }
 
         // Restore the by-edge-id order inside each row.
         //
@@ -223,36 +362,36 @@ impl CsrSnapshot {
             .as_ref()
             .is_some_and(|weights| weights.iter().any(|w| *w < 0.0));
 
-        let (in_row_ptr, in_col_idx, in_edge_type, in_edge_id) =
-            Self::transpose(n, &row_ptr, &col_idx, &edge_type, &edge_id);
+        let (in_row_ptr, in_col_idx, in_edge_type, in_pos) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type);
 
         Ok(Self {
-            row_ptr,
-            col_idx,
-            edge_type,
-            edge_id,
-            edge_weight,
+            row_ptr: row_ptr.into(),
+            col_idx: col_idx.into(),
+            edge_type: edge_type.into(),
+            edge_id: edge_id.into(),
+            edge_weight: edge_weight.map(Array::from),
             has_negative_weight,
-            in_row_ptr,
-            in_col_idx,
-            in_edge_type,
-            in_edge_id,
-            dense_to_id,
+            in_row_ptr: in_row_ptr.into(),
+            in_col_idx: in_col_idx.into(),
+            in_edge_type: in_edge_type.into(),
+            in_pos: in_pos.into(),
+            dense_to_id: dense_to_id.into(),
             id_to_dense,
         })
     }
 
     /// Counting-sort transpose of the outgoing arrays into the incoming view.
     /// Walking the outgoing rows in ascending source order keeps each incoming
-    /// row ordered by ascending source dense index.
+    /// row ordered by ascending source dense index. The last array is the
+    /// outgoing position of each incoming entry, which is where its id lives.
     #[allow(clippy::type_complexity)]
     fn transpose(
         n: usize,
         row_ptr: &[usize],
         col_idx: &[u32],
         edge_type: &[TypeId],
-        edge_id: &[EdgeId],
-    ) -> (Vec<usize>, Vec<u32>, Vec<TypeId>, Vec<EdgeId>) {
+    ) -> (Vec<usize>, Vec<u32>, Vec<TypeId>, Vec<u32>) {
         let total = col_idx.len();
         let mut in_row_ptr = vec![0usize; n + 1];
         for &dst_d in col_idx {
@@ -263,7 +402,7 @@ impl CsrSnapshot {
         }
         let mut in_col_idx = vec![0u32; total];
         let mut in_edge_type = vec![0u32; total];
-        let mut in_edge_id = vec![0u64; total];
+        let mut in_pos = vec![0u32; total];
         let mut cursor = in_row_ptr.clone();
         for src_d in 0..n {
             for k in row_ptr[src_d]..row_ptr[src_d + 1] {
@@ -271,10 +410,10 @@ impl CsrSnapshot {
                 cursor[col_idx[k] as usize] += 1;
                 in_col_idx[slot] = src_d as u32;
                 in_edge_type[slot] = edge_type[k];
-                in_edge_id[slot] = edge_id[k];
+                in_pos[slot] = k as u32;
             }
         }
-        (in_row_ptr, in_col_idx, in_edge_type, in_edge_id)
+        (in_row_ptr, in_col_idx, in_edge_type, in_pos)
     }
 
     /// This snapshot plus the nodes and edges of `change`, without reading the
@@ -312,12 +451,11 @@ impl CsrSnapshot {
             }
         }
         let old_n = self.dense_to_id.len();
-        let mut dense_to_id = self.dense_to_id.clone();
+        let mut dense_to_id = self.dense_to_id.to_vec();
         dense_to_id.extend(added_nodes.iter().copied());
-        let mut id_to_dense = self.id_to_dense.clone();
-        for (i, &id) in added_nodes.iter().enumerate() {
-            id_to_dense.insert(id, (old_n + i) as u32);
-        }
+        // Rebuilt from the array: the contiguous form survives when the new ids
+        // continue the run, and the map form is one insert per node either way.
+        let id_to_dense = DenseIndex::from_sorted(&dense_to_id);
         let n = dense_to_id.len();
 
         // Added entries keyed by (source dense index, edge id): sorted once, they
@@ -326,8 +464,8 @@ impl CsrSnapshot {
             .added_edges
             .iter()
             .filter_map(|e| {
-                let src_d = *id_to_dense.get(&e.src)?;
-                let dst_d = *id_to_dense.get(&e.dst)?;
+                let src_d = id_to_dense.get(&e.src)?;
+                let dst_d = id_to_dense.get(&e.dst)?;
                 Some((src_d, e.edge_id, dst_d, e.edge_type))
             })
             .collect();
@@ -335,6 +473,9 @@ impl CsrSnapshot {
         adds.dedup();
 
         let total = self.col_idx.len() + adds.len();
+        if total > MAX_SNAPSHOT_EDGES {
+            return Ok(None);
+        }
         let mut row_ptr = vec![0usize; n + 1];
         let mut col_idx: Vec<u32> = Vec::with_capacity(total);
         let mut edge_type: Vec<TypeId> = Vec::with_capacity(total);
@@ -400,21 +541,21 @@ impl CsrSnapshot {
         }
         debug_assert_eq!(next_add, adds.len());
 
-        let (in_row_ptr, in_col_idx, in_edge_type, in_edge_id) =
-            Self::transpose(n, &row_ptr, &col_idx, &edge_type, &edge_id);
+        let (in_row_ptr, in_col_idx, in_edge_type, in_pos) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type);
 
         Ok(Some(Self {
-            row_ptr,
-            col_idx,
-            edge_type,
-            edge_id,
-            edge_weight,
+            row_ptr: row_ptr.into(),
+            col_idx: col_idx.into(),
+            edge_type: edge_type.into(),
+            edge_id: edge_id.into(),
+            edge_weight: edge_weight.map(Array::from),
             has_negative_weight,
-            in_row_ptr,
-            in_col_idx,
-            in_edge_type,
-            in_edge_id,
-            dense_to_id,
+            in_row_ptr: in_row_ptr.into(),
+            in_col_idx: in_col_idx.into(),
+            in_edge_type: in_edge_type.into(),
+            in_pos: in_pos.into(),
+            dense_to_id: dense_to_id.into(),
             id_to_dense,
         }))
     }
@@ -448,13 +589,13 @@ impl CsrSnapshot {
         rtxn: &crate::storage::RoTxn,
         row_ptr: &[usize],
         edge_id: &[EdgeId],
-        id_to_dense: &AHashMap<NodeId, u32>,
+        id_to_dense: &DenseIndex,
     ) -> Result<Vec<f64>, Error> {
         let mut weights = vec![1.0f64; edge_id.len()];
         for result in storage.edges.iter(rtxn)? {
             let (id, bytes) = result?;
             let rec: EdgeRecord = props::decode(bytes)?;
-            let Some(&src_d) = id_to_dense.get(&rec.src) else {
+            let Some(src_d) = id_to_dense.get(&rec.src) else {
                 continue;
             };
             let (start, end) = (row_ptr[src_d as usize], row_ptr[src_d as usize + 1]);
@@ -924,7 +1065,7 @@ mod snapshot_tests {
         in_row_ptr: Vec<usize>,
         in_col_idx: Vec<u32>,
         in_edge_type: Vec<TypeId>,
-        in_edge_id: Vec<EdgeId>,
+        in_pos: Vec<u32>,
     }
 
     fn reference_arrays(storage: &Storage) -> Reference {
@@ -996,7 +1137,7 @@ mod snapshot_tests {
         }
         let mut in_col_idx = vec![0u32; total];
         let mut in_edge_type = vec![0u32; total];
-        let mut in_edge_id = vec![0u64; total];
+        let mut in_pos = vec![0u32; total];
         let mut cursor = in_row_ptr.clone();
         for src_d in 0..n {
             for k in row_ptr[src_d]..row_ptr[src_d + 1] {
@@ -1004,7 +1145,7 @@ mod snapshot_tests {
                 cursor[col_idx[k] as usize] += 1;
                 in_col_idx[slot] = src_d as u32;
                 in_edge_type[slot] = edge_type[k];
-                in_edge_id[slot] = edge_id[k];
+                in_pos[slot] = k as u32;
             }
         }
 
@@ -1017,7 +1158,7 @@ mod snapshot_tests {
             in_row_ptr,
             in_col_idx,
             in_edge_type,
-            in_edge_id,
+            in_pos,
         }
     }
 
@@ -1048,7 +1189,7 @@ mod snapshot_tests {
         assert_eq!(got.in_row_ptr, want.in_row_ptr);
         assert_eq!(got.in_col_idx, want.in_col_idx);
         assert_eq!(got.in_edge_type, want.in_edge_type);
-        assert_eq!(got.in_edge_id, want.in_edge_id);
+        assert_eq!(got.in_pos, want.in_pos);
     }
 
     fn full_builds(g: &Graph) -> u64 {
@@ -1310,7 +1451,7 @@ mod snapshot_tests {
                 prop_assert_eq!(&got.in_row_ptr, &want.in_row_ptr);
                 prop_assert_eq!(&got.in_col_idx, &want.in_col_idx);
                 prop_assert_eq!(&got.in_edge_type, &want.in_edge_type);
-                prop_assert_eq!(&got.in_edge_id, &want.in_edge_id);
+                prop_assert_eq!(&got.in_pos, &want.in_pos);
                 Ok(())
             };
             refresh(&g)?;
@@ -1446,11 +1587,11 @@ mod snapshot_tests {
             prop_assert_eq!(&snap.col_idx, &want.col_idx);
             prop_assert_eq!(&snap.edge_type, &want.edge_type);
             prop_assert_eq!(&snap.edge_id, &want.edge_id);
-            prop_assert_eq!(snap.edge_weight.as_ref(), Some(&want.edge_weight));
+            prop_assert_eq!(snap.edge_weight.as_ref().map(|w| w.to_vec()), Some(want.edge_weight.clone()));
             prop_assert_eq!(&snap.in_row_ptr, &want.in_row_ptr);
             prop_assert_eq!(&snap.in_col_idx, &want.in_col_idx);
             prop_assert_eq!(&snap.in_edge_type, &want.in_edge_type);
-            prop_assert_eq!(&snap.in_edge_id, &want.in_edge_id);
+            prop_assert_eq!(&snap.in_pos, &want.in_pos);
 
             // The unweighted build must agree on everything except the weights it
             // deliberately does not load.
@@ -1522,7 +1663,48 @@ mod snapshot_tests {
         );
         // The transpose is derived from those arrays, so it must agree.
         assert_eq!(snap.in_col_idx.len(), 1);
-        assert_eq!(snap.in_edge_id, vec![real]);
+        assert_eq!(snap.edge_id[snap.in_pos[0] as usize], real);
+    }
+
+    /// A graph whose node ids run without gaps gets the table-free index, a
+    /// deletion in the middle sends it to the map, both answer identically, and
+    /// the two representations compare equal when they describe one mapping.
+    #[test]
+    fn dense_index_is_contiguous_without_gaps_and_a_map_with_them() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..5).map(|_| g.add_node("n", &()).unwrap()).collect();
+        let snap = CsrSnapshot::build(&g.storage).unwrap();
+        assert!(snap.id_to_dense.is_contiguous());
+        for (d, id) in ids.iter().enumerate() {
+            assert_eq!(snap.id_to_dense.get(id), Some(d as u32));
+        }
+        assert_eq!(snap.id_to_dense.get(&(ids[4] + 1)), None);
+        assert!(!snap.id_to_dense.contains_key(&u64::MAX));
+        let as_map = DenseIndex::Map(
+            ids.iter()
+                .enumerate()
+                .map(|(d, &id)| (id, d as u32))
+                .collect(),
+        );
+        assert_eq!(snap.id_to_dense, as_map);
+
+        g.delete_node(ids[2]).unwrap();
+        let snap = CsrSnapshot::build(&g.storage).unwrap();
+        assert!(!snap.id_to_dense.is_contiguous(), "a gap needs the map");
+        assert_eq!(snap.id_to_dense.get(&ids[3]), Some(2));
+        assert_eq!(snap.id_to_dense.get(&ids[2]), None);
+        assert_ne!(snap.id_to_dense, as_map);
+
+        // A snapshot whose first id is not zero is still contiguous.
+        let g2 = Graph::open(TempDir::new().unwrap().path(), 1).unwrap();
+        let a = g2.add_node("n", &()).unwrap();
+        let b = g2.add_node("n", &()).unwrap();
+        g2.delete_node(a).unwrap();
+        let snap = CsrSnapshot::build(&g2.storage).unwrap();
+        assert!(snap.id_to_dense.is_contiguous());
+        assert_eq!(snap.id_to_dense.get(&b), Some(0));
+        assert_eq!(snap.id_to_dense.get(&a), None);
     }
 
     /// A duplicate value that is not a whole `AdjEntry` is reported, not silently
@@ -1622,18 +1804,18 @@ mod snapshot_tests {
         let e_aa = g.add_edge(a, a, "t", &()).unwrap();
 
         let snap = CsrSnapshot::build(&g.storage).unwrap();
-        let da = snap.id_to_dense[&a] as usize;
-        let db = snap.id_to_dense[&b] as usize;
-        let dc = snap.id_to_dense[&c] as usize;
+        let da = snap.id_to_dense.get(&a).unwrap() as usize;
+        let db = snap.id_to_dense.get(&b).unwrap() as usize;
+        let dc = snap.id_to_dense.get(&c).unwrap() as usize;
 
         assert_eq!(snap.in_row_ptr.len(), snap.dense_to_id.len() + 1);
         assert_eq!(snap.in_col_idx.len(), snap.col_idx.len());
-        assert_eq!(snap.in_edge_id.len(), snap.col_idx.len());
         assert_eq!(snap.in_edge_type.len(), snap.col_idx.len());
+        assert_eq!(snap.in_pos.len(), snap.col_idx.len());
 
         let in_row = |d: usize| -> Vec<(u32, EdgeId)> {
             (snap.in_row_ptr[d]..snap.in_row_ptr[d + 1])
-                .map(|k| (snap.in_col_idx[k], snap.in_edge_id[k]))
+                .map(|k| (snap.in_col_idx[k], snap.edge_id[snap.in_pos[k] as usize]))
                 .collect()
         };
         assert_eq!(in_row(da), vec![(da as u32, e_aa)]);
@@ -1650,8 +1832,11 @@ mod snapshot_tests {
             .zip(snap.edge_type.iter())
             .map(|(&e, &t)| (e, t))
             .collect();
-        for k in 0..snap.in_edge_id.len() {
-            assert_eq!(snap.in_edge_type[k], out_type[&snap.in_edge_id[k]]);
+        for k in 0..snap.in_pos.len() {
+            assert_eq!(
+                snap.in_edge_type[k],
+                out_type[&snap.edge_id[snap.in_pos[k] as usize]]
+            );
         }
     }
 }
