@@ -18,8 +18,8 @@
 //! The CSR format is little-endian: a magic tag, the 128-bit database
 //! identity (see [`crate::storage::Storage::db_id`]), the generation, flags,
 //! the two array lengths, the arrays themselves in a fixed order, and a
-//! 64-bit checksum folded over every preceding byte. The `id_to_dense` map is
-//! not stored; it is rebuilt from `dense_to_id` on load. The columns files
+//! 64-bit checksum folded over every preceding byte. The `id_to_dense` index is
+//! not stored; it is derived from `dense_to_id` on load. The columns files
 //! carry a msgpack payload behind the same header and checksum discipline.
 //! The identity is what refuses a file left behind by a different database at
 //! a coincidentally matching generation, which a restore into a directory
@@ -351,11 +351,7 @@ pub(crate) fn load_csr(
     };
     debug_assert_eq!(offset, body_len);
 
-    let id_to_dense = dense_to_id
-        .iter()
-        .enumerate()
-        .map(|(d, &id)| (id, d as u32))
-        .collect();
+    let id_to_dense = crate::csr::DenseIndex::from_sorted(&dense_to_id);
     Some(CsrSnapshot {
         row_ptr,
         col_idx,
@@ -1204,7 +1200,7 @@ mod tests {
         assert_eq!(patched.col_idx.len(), 3);
         assert!(patched.edge_id.contains(&e));
         assert_eq!(loaded.col_idx.len(), 2, "the mapped snapshot is immutable");
-        let first_in_of_c = patched.in_row_ptr[patched.id_to_dense[&c] as usize];
+        let first_in_of_c = patched.in_row_ptr[patched.id_to_dense.get(&c).unwrap() as usize];
         assert_eq!(patched.edge_id[patched.in_pos[first_in_of_c] as usize], e);
 
         // Replacing the file under the live mapping (what `rebuild_csr` does)

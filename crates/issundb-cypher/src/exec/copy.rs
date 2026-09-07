@@ -188,6 +188,7 @@ pub(super) fn execute_copy_internal(
     if is_relationship {
         let mut pending = Some(first);
         let imported = graph.update(|txn| {
+            txn.begin_bulk_load();
             loop {
                 let mut obj = match pending.take() {
                     Some(obj) => obj,
@@ -237,6 +238,7 @@ pub(super) fn execute_copy_internal(
     } else {
         let mut pending = Some(first);
         let imported = graph.update(|txn| {
+            txn.begin_bulk_load();
             loop {
                 let mut obj = match pending.take() {
                     Some(obj) => obj,

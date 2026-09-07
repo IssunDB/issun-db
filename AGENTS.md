@@ -125,7 +125,9 @@ section, and a public method's contract lives under Component APIs. Do not inven
 ## Architecture Constraints
 
 - Adjacency is stored as LMDB `DUPSORT + DUPFIXED`: each duplicate value under a node key is one raw `AdjEntry` (20 bytes). A single `db.put` appends
-  one entry in O(log n); there is no read-modify-write of a blob.
+  one entry in O(log n); there is no read-modify-write of a blob. A bulk load (`WriteTxn::begin_bulk_load`, which `COPY` and `IMPORT DATABASE`
+  turn on) buffers the entries and writes them sorted by node id, because one random put per edge dirties a B-tree page per edge; reads inside that
+  transaction merge the buffer, so results do not change.
 - The label index (`label_idx`) uses 12-byte composite keys `(u32 BE, u64 BE)` with `Unit` values, so a prefix scan enumerates a label's nodes in
   ascending ID order. A multi-label node has one entry per label. There is no edge type index: `edges_by_type` is one filtered pass over `edges`, which
   iterates in ascending edge id, per-type counts come from the `stats:t:` counters, and the counting kernels and the Cypher executor read the CSR

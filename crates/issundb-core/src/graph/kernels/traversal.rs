@@ -60,7 +60,7 @@ impl Graph {
     /// error, since a traversal from a node that is not there has reached nothing.
     pub fn bfs(&self, start: NodeId, hops: u8) -> Result<Vec<NodeId>, Error> {
         self.with_snapshot(|snap| {
-            let Some(&start_dense) = snap.id_to_dense.get(&start) else {
+            let Some(start_dense) = snap.id_to_dense.get(&start) else {
                 return Ok(vec![]);
             };
             let mut levels = vec![UNREACHED; snap.dense_to_id.len()];
@@ -106,7 +106,7 @@ impl Graph {
             let mut truncated = false;
             let mut visited = 0usize;
             for &seed in seeds {
-                let Some(&dense) = snap.id_to_dense.get(&seed) else {
+                let Some(dense) = snap.id_to_dense.get(&seed) else {
                     continue;
                 };
                 if levels[dense as usize] != UNREACHED {
@@ -233,7 +233,7 @@ impl Graph {
         let mut results = Vec::new();
         for &src in src_nodes {
             let d = match snap.id_to_dense.get(&src) {
-                Some(&d) => d as usize,
+                Some(d) => d as usize,
                 None => continue,
             };
             for k in row_ptr[d]..row_ptr[d + 1] {

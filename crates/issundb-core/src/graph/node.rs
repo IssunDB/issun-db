@@ -37,6 +37,21 @@ impl Graph {
         labels: &[&str],
         props: &impl Serialize,
     ) -> Result<NodeId, Error> {
+        self.add_node_inner(wtxn, None, labels, props)
+    }
+
+    /// [`Graph::add_node_impl`] with the transaction's batch cache, which
+    /// allocates the id and records the label counts in memory for one write
+    /// at commit. Every node inserted inside one `WriteTxn` must take this
+    /// route: an allocation straight from `meta` alongside the cached counter
+    /// would hand out the same id twice.
+    pub(super) fn add_node_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        mut cache: Option<&mut super::WriteBatchCache>,
+        labels: &[&str],
+        props: &impl Serialize,
+    ) -> Result<NodeId, Error> {
         let encoded_props = props::encode(props)?;
         let props_json: serde_json::Value = props::decode(&encoded_props)?;
 
@@ -49,7 +64,10 @@ impl Graph {
             }
         }
 
-        let node_id = alloc_node_id(&self.storage, wtxn)?;
+        let node_id = match cache.as_deref_mut() {
+            Some(c) => c.alloc_node_id(&self.storage, wtxn)?,
+            None => alloc_node_id(&self.storage, wtxn)?,
+        };
         let record = NodeRecord {
             labels: resolved.iter().map(|(id, _)| *id).collect(),
             props: encoded_props,
@@ -64,7 +82,10 @@ impl Graph {
             self.storage
                 .label_idx
                 .put(wtxn, &composite_key(*label_id, node_id), &())?;
-            adjust_label_count(&self.storage, wtxn, *label_id, 1)?;
+            match cache.as_deref_mut() {
+                Some(c) => c.bump_label_count(*label_id, 1),
+                None => adjust_label_count(&self.storage, wtxn, *label_id, 1)?,
+            }
             self.index_node_for_label(wtxn, *label_id, label_name, node_id, &props_json)?;
         }
 
@@ -366,6 +387,18 @@ impl Graph {
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
+        self.add_label_inner(wtxn, None, id, label)
+    }
+
+    /// [`Graph::add_label_impl`] with the transaction's batch cache for the
+    /// label count.
+    pub(super) fn add_label_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        cache: Option<&mut super::WriteBatchCache>,
+        id: NodeId,
+        label: &str,
+    ) -> Result<(), Error> {
         let mut record: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
             Some(bytes) => props::decode(bytes)?,
             None => return Err(Error::NodeNotFound(id)),
@@ -382,7 +415,10 @@ impl Graph {
         self.storage
             .label_idx
             .put(wtxn, &composite_key(label_id, id), &())?;
-        adjust_label_count(&self.storage, wtxn, label_id, 1)?;
+        match cache {
+            Some(c) => c.bump_label_count(label_id, 1),
+            None => adjust_label_count(&self.storage, wtxn, label_id, 1)?,
+        }
         self.index_node_for_label(wtxn, label_id, label, id, &props_json)?;
         Ok(())
     }
@@ -405,6 +441,18 @@ impl Graph {
         id: NodeId,
         label: &str,
     ) -> Result<(), Error> {
+        self.remove_label_inner(wtxn, None, id, label)
+    }
+
+    /// [`Graph::remove_label_impl`] with the transaction's batch cache for the
+    /// label count.
+    pub(super) fn remove_label_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        cache: Option<&mut super::WriteBatchCache>,
+        id: NodeId,
+        label: &str,
+    ) -> Result<(), Error> {
         let mut record: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
             Some(bytes) => props::decode(bytes)?,
             None => return Ok(()),
@@ -422,7 +470,10 @@ impl Graph {
             self.storage
                 .label_idx
                 .delete(wtxn, &composite_key(label_id, id))?;
-            adjust_label_count(&self.storage, wtxn, label_id, -1)?;
+            match cache {
+                Some(c) => c.bump_label_count(label_id, -1),
+                None => adjust_label_count(&self.storage, wtxn, label_id, -1)?,
+            }
             self.unindex_node_for_label(wtxn, label_id, id, &props_json)?;
         }
         Ok(())
@@ -476,6 +527,19 @@ impl Graph {
         wtxn: &mut crate::storage::RwTxn,
         id: NodeId,
     ) -> Result<(), Error> {
+        self.delete_node_inner(wtxn, None, id)
+    }
+
+    /// [`Graph::delete_node_impl`] with the transaction's batch cache, which
+    /// takes the label and type count changes so they combine with the batch's
+    /// additions instead of being clamped against a stored count that has not
+    /// absorbed them yet.
+    pub(super) fn delete_node_inner(
+        &self,
+        wtxn: &mut crate::storage::RwTxn,
+        mut cache: Option<&mut super::WriteBatchCache>,
+        id: NodeId,
+    ) -> Result<(), Error> {
         let record: NodeRecord = match self.storage.nodes.get(wtxn, &id)? {
             Some(bytes) => props::decode(bytes)?,
             None => return Ok(()),
@@ -490,7 +554,10 @@ impl Graph {
             self.storage
                 .label_idx
                 .delete(wtxn, &composite_key(label_id, id))?;
-            adjust_label_count(&self.storage, wtxn, label_id, -1)?;
+            match cache.as_deref_mut() {
+                Some(c) => c.bump_label_count(label_id, -1),
+                None => adjust_label_count(&self.storage, wtxn, label_id, -1)?,
+            }
         }
 
         let mut out_edges = Vec::new();
@@ -512,7 +579,10 @@ impl Graph {
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
 
-            adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
+            match cache.as_deref_mut() {
+                Some(c) => c.bump_type_count(entry.edge_type, -1),
+                None => adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?,
+            }
 
             let in_entry = AdjEntry {
                 edge_type: entry.edge_type,
@@ -543,7 +613,10 @@ impl Graph {
             }
             self.storage.edges.delete(wtxn, &edge_id)?;
 
-            adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?;
+            match cache.as_deref_mut() {
+                Some(c) => c.bump_type_count(entry.edge_type, -1),
+                None => adjust_type_count(&self.storage, wtxn, entry.edge_type, -1)?,
+            }
 
             let out_entry = AdjEntry {
                 edge_type: entry.edge_type,

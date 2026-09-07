@@ -78,7 +78,7 @@ impl Graph {
                 None => {
                     let mut mask = vec![false; n];
                     for &id in self.nodes_by_label_arc(name)?.iter() {
-                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                        if let Some(d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
                     }
@@ -242,7 +242,7 @@ impl Graph {
                 None => {
                     let mut mask = vec![false; n];
                     for &id in self.nodes_by_label_arc(name)?.iter() {
-                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                        if let Some(d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
                     }
@@ -262,7 +262,7 @@ impl Graph {
             let Some(ids) = allow else { continue };
             let mut amask = vec![false; n];
             for &id in ids {
-                if let Some(&d) = snap.id_to_dense.get(&id) {
+                if let Some(d) = snap.id_to_dense.get(&id) {
                     amask[d as usize] = true;
                 }
             }
@@ -444,7 +444,7 @@ impl Graph {
                 Some(name) => {
                     let mut mask = vec![false; n];
                     for &id in self.nodes_by_label_arc(name)?.iter() {
-                        if let Some(&d) = snap.id_to_dense.get(&id) {
+                        if let Some(d) = snap.id_to_dense.get(&id) {
                             mask[d as usize] = true;
                         }
                     }
@@ -466,7 +466,7 @@ impl Graph {
         if let Some(allow) = spec.counted_allow {
             let mut allowed = vec![false; n];
             for id in allow {
-                if let Some(&d) = snap.id_to_dense.get(id) {
+                if let Some(d) = snap.id_to_dense.get(id) {
                     allowed[d as usize] = true;
                 }
             }
@@ -646,7 +646,7 @@ impl Graph {
         let mut mask = vec![false; visited.len()];
         for (id, is_present) in ids.iter().zip(present) {
             if is_present {
-                if let Some(&d) = snap.id_to_dense.get(id) {
+                if let Some(d) = snap.id_to_dense.get(id) {
                     mask[d as usize] = true;
                 }
             }
@@ -769,7 +769,7 @@ impl Graph {
         };
         let mut span = 0u64;
         for src in sources {
-            if let Some(&d) = snap.id_to_dense.get(src) {
+            if let Some(d) = snap.id_to_dense.get(src) {
                 let d = d as usize;
                 span = span.saturating_add((row_ptr[d + 1] - row_ptr[d]) as u64);
             }
@@ -834,7 +834,7 @@ impl Graph {
         for name in spec.neighbor_labels {
             let mut mask = vec![false; n];
             for &id in self.nodes_by_label_arc(name)?.iter() {
-                if let Some(&d) = snap.id_to_dense.get(&id) {
+                if let Some(d) = snap.id_to_dense.get(&id) {
                     mask[d as usize] = true;
                 }
             }
@@ -843,7 +843,7 @@ impl Graph {
         if let Some(allow) = spec.neighbor_allow {
             let mut mask = vec![false; n];
             for id in allow {
-                if let Some(&d) = snap.id_to_dense.get(id) {
+                if let Some(d) = snap.id_to_dense.get(id) {
                     mask[d as usize] = true;
                 }
             }
@@ -908,14 +908,18 @@ impl Graph {
         // number of incoming entries the sources span.
         let dense: Vec<Option<usize>> = sources
             .iter()
-            .map(|src| snap.id_to_dense.get(src).map(|&d| d as usize))
+            .map(|src| snap.id_to_dense.get(src).map(|d| d as usize))
             .collect();
 
-        // When the sources span a large share of the incoming view (a grouped
-        // count over a whole label), one sequential pass over the outgoing
-        // arrays that tallies each qualifying edge at its destination beats
-        // walking each source's incoming row: measured at 2M persons, the
-        // grouped follower count per city dropped by a fifth.
+        // When the sources span most of the incoming view (a grouped count over
+        // a whole label), one sequential pass over the outgoing arrays that
+        // tallies each qualifying edge at its destination beats walking each
+        // source's incoming row, because the neighbor label test runs once per
+        // source row instead of once per edge at a random index: measured at 2M
+        // persons, the grouped follower count per city dropped by a fifth. The
+        // pass costs the whole edge set, so a source set spanning less than half
+        // of it walks its rows instead; a count over two thousand cities sent
+        // through the pass ran 40% slower than the walk.
         let incoming_span: usize = if spec.incoming && type_id.is_some() {
             dense
                 .iter()
@@ -925,7 +929,7 @@ impl Graph {
         } else {
             0
         };
-        let tally_incoming = incoming_span.saturating_mul(16) >= snap.col_idx.len();
+        let tally_incoming = incoming_span.saturating_mul(2) >= snap.col_idx.len();
         let mut wanted = Vec::new();
         if tally_incoming {
             wanted = vec![false; n];

@@ -76,6 +76,16 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   ```
 
 - Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
+- A `WriteTxn` batches its bookkeeping in `WriteBatchCache` and writes it just before the commit, in the same transaction. The next node and edge
+  ids are read from `meta` once and handed out from memory, and the per-label and per-type counts accumulate as deltas; both were a `meta` read and
+  write per record, a sixth of a bulk load. Every allocation and count change inside a `WriteTxn` must go through the cache (the `_inner` forms of
+  the node and edge writers take it): an allocation straight from `meta` beside the cached counter hands out an id twice, and a direct count
+  adjustment is clamped at zero against a stored count that has not absorbed the batch's additions. `WriteTxn::node_count_by_label` and
+  `edge_count_by_type` add the pending deltas, so a count read inside the transaction sees its own writes.
+- `WriteTxn::begin_bulk_load` (used by `COPY ... FROM` and `IMPORT DATABASE`) additionally buffers the adjacency entries and writes each direction
+  sorted by node id, in chunks of `ADJ_FLUSH_THRESHOLD` and at commit. One random `in_adj` put per edge dirtied a B-tree leaf per edge, and past a
+  few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
+  stored entries in store order, and a deletion flushes the buffer before it walks the stores.
 
 ## Thread Count
 
@@ -107,7 +117,9 @@ adjacency structure, and every algorithm kernel in `graph/kernels/` reads it, ba
 exception in that module's header.
 
 Every array is an `Array<T>` (`array.rs`): a `Vec` when the snapshot was built or patched in this process, a view into the memory-mapped cache file
-when it was loaded. Both dereference to `&[T]`, so a kernel indexes them the same way, and a loaded snapshot owns no heap beyond `id_to_dense`. The
+when it was loaded. Both dereference to `&[T]`, so a kernel indexes them the same way. `id_to_dense` is a `DenseIndex`: table-free when the node ids
+run without gaps (dense index = id minus the first id, which every bulk-loaded graph has), a hash map otherwise. A whole-label mask over two million
+nodes went from 60 ms of hash probes to 2 ms of subtractions, and a loaded contiguous snapshot owns no heap at all. The
 mapped pages are the page cache's: shared between processes, evictable under pressure, and resident only where a query has read. Mutation goes through
 `Array::with_mut`, which copies a mapped view onto the heap first; nothing ever writes through a mapping.
 

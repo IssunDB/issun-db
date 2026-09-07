@@ -62,12 +62,99 @@ pub struct CsrSnapshot {
     /// incoming direction reads it, one random read per emitted edge.
     pub in_pos: Array<u32>,
     pub dense_to_id: Array<NodeId>,
-    pub id_to_dense: AHashMap<NodeId, u32>,
+    pub id_to_dense: DenseIndex,
 }
 
 /// The largest number of edges a snapshot can hold: `in_pos` addresses the
 /// outgoing arrays with 32 bits.
 pub const MAX_SNAPSHOT_EDGES: usize = u32::MAX as usize;
+
+/// Node id to dense index, the inverse of `dense_to_id`.
+///
+/// Every bulk-loaded graph allocates its node ids without gaps, so the dense
+/// index of an id is the id's offset from the first one and no table is
+/// needed: the lookup is a subtraction and a bounds check, and a loaded
+/// snapshot owns no heap for it at all. A graph with deleted nodes (or one
+/// that never had contiguous ids) falls back to the hash map, which was the
+/// only representation before and costs a probe per lookup plus tens of
+/// megabytes per million nodes.
+#[derive(Debug, Clone)]
+pub enum DenseIndex {
+    /// `dense_to_id[d] == first + d` for every `d < n`.
+    Contiguous {
+        first: NodeId,
+        n: u32,
+    },
+    Map(AHashMap<NodeId, u32>),
+}
+
+impl DenseIndex {
+    /// The index of `dense_to_id`, which must be sorted ascending and free of
+    /// duplicates (a snapshot's node array always is).
+    pub fn from_sorted(dense_to_id: &[NodeId]) -> Self {
+        let n = dense_to_id.len();
+        if n <= u32::MAX as usize {
+            if let (Some(&first), Some(&last)) = (dense_to_id.first(), dense_to_id.last()) {
+                if last - first + 1 == n as u64 {
+                    return Self::Contiguous { first, n: n as u32 };
+                }
+            }
+            if n == 0 {
+                return Self::Contiguous { first: 0, n: 0 };
+            }
+        }
+        Self::Map(
+            dense_to_id
+                .iter()
+                .enumerate()
+                .map(|(d, &id)| (id, d as u32))
+                .collect(),
+        )
+    }
+
+    #[inline]
+    pub fn get(&self, id: &NodeId) -> Option<u32> {
+        match self {
+            Self::Contiguous { first, n } => {
+                let offset = id.checked_sub(*first)?;
+                (offset < *n as u64).then_some(offset as u32)
+            }
+            Self::Map(map) => map.get(id).copied(),
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, id: &NodeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Contiguous { n, .. } => *n as usize,
+            Self::Map(map) => map.len(),
+        }
+    }
+
+    /// Whether this is the table-free representation.
+    #[cfg(test)]
+    pub fn is_contiguous(&self) -> bool {
+        matches!(self, Self::Contiguous { .. })
+    }
+}
+
+impl PartialEq for DenseIndex {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Contiguous { first, n }, Self::Contiguous { first: f2, n: n2 }) => {
+                first == f2 && n == n2
+            }
+            (Self::Map(a), Self::Map(b)) => a == b,
+            (Self::Map(map), other) | (other, Self::Map(map)) => {
+                map.len() == other.len() && map.iter().all(|(id, &d)| other.get(id) == Some(d))
+            }
+        }
+    }
+}
 
 impl CsrSnapshot {
     /// An empty snapshot: no nodes, no edges. Used as the placeholder a graph
@@ -86,7 +173,7 @@ impl CsrSnapshot {
             in_edge_type: Array::default(),
             in_pos: Array::default(),
             dense_to_id: Array::default(),
-            id_to_dense: AHashMap::new(),
+            id_to_dense: DenseIndex::from_sorted(&[]),
         }
     }
 
@@ -144,11 +231,7 @@ impl CsrSnapshot {
         dense_to_id.sort_unstable();
 
         let n = dense_to_id.len();
-        let id_to_dense: AHashMap<NodeId, u32> = dense_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i as u32))
-            .collect();
+        let id_to_dense = DenseIndex::from_sorted(&dense_to_id);
 
         // One pass over `out_adj`. Keys ascend by node id and the dense index is
         // the rank in that same order, so the entries arrive grouped by ascending
@@ -170,7 +253,7 @@ impl CsrSnapshot {
             // of one node arrive consecutively.
             if cached_src != Some(src) {
                 cached_src = Some(src);
-                src_dense = id_to_dense.get(&src).copied();
+                src_dense = id_to_dense.get(&src);
             }
             // An endpoint with no record in `nodes` has no dense index, so its
             // entries are skipped, exactly as the previous builder skipped an edge
@@ -181,7 +264,7 @@ impl CsrSnapshot {
             // Copied out before use: `AdjEntry` is `repr(packed)`, so a field
             // cannot be borrowed.
             let dst = entry.other;
-            let Some(&dst_d) = id_to_dense.get(&dst) else {
+            let Some(dst_d) = id_to_dense.get(&dst) else {
                 continue;
             };
             row_ptr[src_d as usize + 1] += 1;
@@ -343,10 +426,9 @@ impl CsrSnapshot {
         let old_n = self.dense_to_id.len();
         let mut dense_to_id = self.dense_to_id.to_vec();
         dense_to_id.extend(added_nodes.iter().copied());
-        let mut id_to_dense = self.id_to_dense.clone();
-        for (i, &id) in added_nodes.iter().enumerate() {
-            id_to_dense.insert(id, (old_n + i) as u32);
-        }
+        // Rebuilt from the array: the contiguous form survives when the new ids
+        // continue the run, and the map form is one insert per node either way.
+        let id_to_dense = DenseIndex::from_sorted(&dense_to_id);
         let n = dense_to_id.len();
 
         // Added entries keyed by (source dense index, edge id): sorted once, they
@@ -355,8 +437,8 @@ impl CsrSnapshot {
             .added_edges
             .iter()
             .filter_map(|e| {
-                let src_d = *id_to_dense.get(&e.src)?;
-                let dst_d = *id_to_dense.get(&e.dst)?;
+                let src_d = id_to_dense.get(&e.src)?;
+                let dst_d = id_to_dense.get(&e.dst)?;
                 Some((src_d, e.edge_id, dst_d, e.edge_type))
             })
             .collect();
@@ -480,13 +562,13 @@ impl CsrSnapshot {
         rtxn: &crate::storage::RoTxn,
         row_ptr: &[usize],
         edge_id: &[EdgeId],
-        id_to_dense: &AHashMap<NodeId, u32>,
+        id_to_dense: &DenseIndex,
     ) -> Result<Vec<f64>, Error> {
         let mut weights = vec![1.0f64; edge_id.len()];
         for result in storage.edges.iter(rtxn)? {
             let (id, bytes) = result?;
             let rec: EdgeRecord = props::decode(bytes)?;
-            let Some(&src_d) = id_to_dense.get(&rec.src) else {
+            let Some(src_d) = id_to_dense.get(&rec.src) else {
                 continue;
             };
             let (start, end) = (row_ptr[src_d as usize], row_ptr[src_d as usize + 1]);
@@ -1557,6 +1639,47 @@ mod snapshot_tests {
         assert_eq!(snap.edge_id[snap.in_pos[0] as usize], real);
     }
 
+    /// A graph whose node ids run without gaps gets the table-free index, a
+    /// deletion in the middle sends it to the map, both answer identically, and
+    /// the two representations compare equal when they describe one mapping.
+    #[test]
+    fn dense_index_is_contiguous_without_gaps_and_a_map_with_them() {
+        let dir = TempDir::new().unwrap();
+        let g = Graph::open(dir.path(), 1).unwrap();
+        let ids: Vec<NodeId> = (0..5).map(|_| g.add_node("n", &()).unwrap()).collect();
+        let snap = CsrSnapshot::build(&g.storage).unwrap();
+        assert!(snap.id_to_dense.is_contiguous());
+        for (d, id) in ids.iter().enumerate() {
+            assert_eq!(snap.id_to_dense.get(id), Some(d as u32));
+        }
+        assert_eq!(snap.id_to_dense.get(&(ids[4] + 1)), None);
+        assert!(!snap.id_to_dense.contains_key(&u64::MAX));
+        let as_map = DenseIndex::Map(
+            ids.iter()
+                .enumerate()
+                .map(|(d, &id)| (id, d as u32))
+                .collect(),
+        );
+        assert_eq!(snap.id_to_dense, as_map);
+
+        g.delete_node(ids[2]).unwrap();
+        let snap = CsrSnapshot::build(&g.storage).unwrap();
+        assert!(!snap.id_to_dense.is_contiguous(), "a gap needs the map");
+        assert_eq!(snap.id_to_dense.get(&ids[3]), Some(2));
+        assert_eq!(snap.id_to_dense.get(&ids[2]), None);
+        assert_ne!(snap.id_to_dense, as_map);
+
+        // A snapshot whose first id is not zero is still contiguous.
+        let g2 = Graph::open(TempDir::new().unwrap().path(), 1).unwrap();
+        let a = g2.add_node("n", &()).unwrap();
+        let b = g2.add_node("n", &()).unwrap();
+        g2.delete_node(a).unwrap();
+        let snap = CsrSnapshot::build(&g2.storage).unwrap();
+        assert!(snap.id_to_dense.is_contiguous());
+        assert_eq!(snap.id_to_dense.get(&b), Some(0));
+        assert_eq!(snap.id_to_dense.get(&a), None);
+    }
+
     /// A duplicate value that is not a whole `AdjEntry` is reported, not silently
     /// reinterpreted. The size in the message is the layout invariant declared on the
     /// struct, which is why the check lives on the type.
@@ -1654,9 +1777,9 @@ mod snapshot_tests {
         let e_aa = g.add_edge(a, a, "t", &()).unwrap();
 
         let snap = CsrSnapshot::build(&g.storage).unwrap();
-        let da = snap.id_to_dense[&a] as usize;
-        let db = snap.id_to_dense[&b] as usize;
-        let dc = snap.id_to_dense[&c] as usize;
+        let da = snap.id_to_dense.get(&a).unwrap() as usize;
+        let db = snap.id_to_dense.get(&b).unwrap() as usize;
+        let dc = snap.id_to_dense.get(&c).unwrap() as usize;
 
         assert_eq!(snap.in_row_ptr.len(), snap.dense_to_id.len() + 1);
         assert_eq!(snap.in_col_idx.len(), snap.col_idx.len());

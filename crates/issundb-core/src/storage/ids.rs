@@ -2,8 +2,8 @@ use crate::error::Error;
 use crate::schema::{EdgeId, LabelId, NodeId, PropKeyId, TypeId};
 use crate::storage::Storage;
 
-const KEY_NEXT_NODE: &str = "next_node_id";
-const KEY_NEXT_EDGE: &str = "next_edge_id";
+pub(crate) const KEY_NEXT_NODE: &str = "next_node_id";
+pub(crate) const KEY_NEXT_EDGE: &str = "next_edge_id";
 const KEY_NEXT_LABEL: &str = "next_label_id";
 const KEY_NEXT_TYPE: &str = "next_type_id";
 const KEY_NEXT_PROP_KEY: &str = "next_prop_key_id";
@@ -14,7 +14,18 @@ fn bump_counter(
     txn: &mut crate::storage::RwTxn,
     key: &str,
 ) -> Result<u64, Error> {
-    let current = storage
+    let current = read_counter(storage, txn, key)?;
+    write_counter(storage, txn, key, current + 1)?;
+    Ok(current)
+}
+
+/// The value of a `meta` counter, `0` when it was never written.
+pub(crate) fn read_counter(
+    storage: &Storage,
+    txn: &crate::storage::RoTxn,
+    key: &str,
+) -> Result<u64, Error> {
+    storage
         .meta
         .get(txn, key)?
         .map(|b| {
@@ -23,10 +34,19 @@ fn bump_counter(
                 .map_err(|_| Error::Corrupt("counter must be 8 bytes"))?;
             Ok::<u64, Error>(u64::from_be_bytes(arr))
         })
-        .transpose()?
-        .unwrap_or(0);
-    storage.meta.put(txn, key, &(current + 1).to_be_bytes())?;
-    Ok(current)
+        .transpose()
+        .map(|v| v.unwrap_or(0))
+}
+
+/// Store a `meta` counter.
+pub(crate) fn write_counter(
+    storage: &Storage,
+    txn: &mut crate::storage::RwTxn,
+    key: &str,
+    value: u64,
+) -> Result<(), Error> {
+    storage.meta.put(txn, key, &value.to_be_bytes())?;
+    Ok(())
 }
 
 pub fn alloc_node_id(storage: &Storage, txn: &mut crate::storage::RwTxn) -> Result<NodeId, Error> {
