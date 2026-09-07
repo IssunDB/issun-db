@@ -35,7 +35,7 @@ use crate::csr::CsrSnapshot;
 use crate::error::Error;
 use crate::schema::{EdgeId, NodeId, TypeId};
 
-const MAGIC: &[u8; 8] = b"ISSNCSR3";
+const MAGIC: &[u8; 8] = b"ISSNCSR1";
 const FLAG_WEIGHTED: u64 = 1;
 const FLAG_NEGATIVE_WEIGHT: u64 = 2;
 
@@ -227,8 +227,12 @@ pub(crate) fn save_csr(
         w.put_u64s(&snap.edge_id)?;
         w.put_usizes(&snap.in_row_ptr)?;
         w.put_u32s(&snap.in_col_idx)?;
+        w.put_u32s(&snap.in_edge_type)?;
         w.put_u32s(&snap.in_pos)?;
         if let Some(weights) = &snap.edge_weight {
+            // Five 4-byte arrays end 4 bytes short of an 8-byte boundary when
+            // the edge count is odd; the weights are 8-byte values.
+            w.put(&[0u8; 8][..weight_padding(snap.col_idx.len() as u64)])?;
             w.put_f64s(weights)?;
         }
         w.finish()
@@ -247,17 +251,26 @@ fn csr_file_len(n: u64, e: u64, weighted: bool) -> Option<u64> {
     // Header plus the trailing checksum.
     let mut total = CSR_HEADER_LEN as u64 + 8;
     // `dense_to_id`, the two `(n + 1)`-long row-pointer arrays, and `edge_id`
-    // are 8 bytes per element; `col_idx`, `edge_type`, `in_col_idx`, and
-    // `in_pos` are 4 bytes per element.
+    // are 8 bytes per element; `col_idx`, `edge_type`, `in_col_idx`,
+    // `in_edge_type`, and `in_pos` are 4 bytes per element. The five 4-byte
+    // arrays total `20e` bytes, so `in_pos` (the last of them) can start on a
+    // 4-byte boundary only, which is all a `u32` array needs.
     let u64_elems = n
         .checked_add(n.checked_add(1)?.checked_mul(2)?)?
         .checked_add(e)?;
     total = total.checked_add(u64_elems.checked_mul(8)?)?;
-    total = total.checked_add(e.checked_mul(4)?.checked_mul(4)?)?;
+    total = total.checked_add(e.checked_mul(4)?.checked_mul(5)?)?;
     if weighted {
+        total = total.checked_add(weight_padding(e) as u64)?;
         total = total.checked_add(e.checked_mul(8)?)?;
     }
     Some(total)
+}
+
+/// Bytes between the last 4-byte array and the weights, so the weights start
+/// 8-byte aligned: the five 4-byte arrays total `20e` bytes.
+fn weight_padding(e: u64) -> usize {
+    if e % 2 == 1 { 4 } else { 0 }
 }
 
 /// Map the cache file if it exists, carries `db_id`, and reflects
@@ -326,8 +339,12 @@ pub(crate) fn load_csr(
     let edge_id: Array<EdgeId> = Array::mapped(&file, take(e, 8)?, e)?;
     let in_row_ptr: Array<usize> = Array::mapped(&file, take(n + 1, 8)?, n + 1)?;
     let in_col_idx: Array<u32> = Array::mapped(&file, take(e, 4)?, e)?;
+    let in_edge_type: Array<TypeId> = Array::mapped(&file, take(e, 4)?, e)?;
     let in_pos: Array<u32> = Array::mapped(&file, take(e, 4)?, e)?;
+    // Five 4-byte arrays leave the offset 4 bytes short of a multiple of 8 when
+    // `e` is odd; the weights are 8-byte values, so realign before them.
     let edge_weight = if weighted {
+        take(weight_padding(e64), 1)?;
         Some(Array::<f64>::mapped(&file, take(e, 8)?, e)?)
     } else {
         None
@@ -348,13 +365,14 @@ pub(crate) fn load_csr(
         has_negative_weight: flags & FLAG_NEGATIVE_WEIGHT != 0,
         in_row_ptr,
         in_col_idx,
+        in_edge_type,
         in_pos,
         dense_to_id,
         id_to_dense,
     })
 }
 
-const COL_MAGIC: &[u8; 8] = b"ISSNCOL3";
+const COL_MAGIC: &[u8; 8] = b"ISSNCOL1";
 
 /// Bytes of the fixed columns header: magic, database identity, generation,
 /// entity count, column count, and the directory length.
@@ -1256,6 +1274,7 @@ mod tests {
         assert!(loaded.has_negative_weight);
         assert_eq!(loaded.in_row_ptr, snap.in_row_ptr);
         assert_eq!(loaded.in_col_idx, snap.in_col_idx);
+        assert_eq!(loaded.in_edge_type, snap.in_edge_type);
         assert_eq!(loaded.in_pos, snap.in_pos);
         assert_eq!(loaded.dense_to_id, snap.dense_to_id);
         assert_eq!(loaded.id_to_dense, snap.id_to_dense);

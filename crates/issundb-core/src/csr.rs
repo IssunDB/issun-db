@@ -51,13 +51,15 @@ pub struct CsrSnapshot {
     /// indices, and entries within a row are ordered by ascending source.
     pub in_row_ptr: Array<usize>,
     pub in_col_idx: Array<u32>,
+    /// The type of each incoming entry, duplicated from the outgoing arrays so
+    /// that a typed scan of an incoming row is one sequential read; reading it
+    /// through `in_pos` instead costs a random read per entry, which doubled the
+    /// two-hop count kernel's time.
+    pub in_edge_type: Array<TypeId>,
     /// For each incoming entry, the position of the same edge in the outgoing
-    /// arrays, so its type and id are `edge_type[in_pos[k]]` (see
-    /// [`CsrSnapshot::in_edge_type`]) and `edge_id[in_pos[k]]`. Four bytes per
-    /// edge in place of the twelve
-    /// a duplicated type and id cost; the indirection is one random read per
-    /// incoming entry whose type or id a kernel asks for, and the kernels that
-    /// scan the incoming view for its structure alone never pay it.
+    /// arrays, so its id is `edge_id[in_pos[k]]`. Four bytes per edge in place
+    /// of a duplicated eight-byte id; only a rel-binding expansion in the
+    /// incoming direction reads it, one random read per emitted edge.
     pub in_pos: Array<u32>,
     pub dense_to_id: Array<NodeId>,
     pub id_to_dense: AHashMap<NodeId, u32>,
@@ -81,16 +83,11 @@ impl CsrSnapshot {
             has_negative_weight: false,
             in_row_ptr: vec![0].into(),
             in_col_idx: Array::default(),
+            in_edge_type: Array::default(),
             in_pos: Array::default(),
             dense_to_id: Array::default(),
             id_to_dense: AHashMap::new(),
         }
-    }
-
-    /// The type id of the k-th incoming entry, read through `in_pos`.
-    #[inline]
-    pub fn in_edge_type(&self, k: usize) -> TypeId {
-        self.edge_type[self.in_pos[k] as usize]
     }
 
     /// The error for an edge count `in_pos` cannot address.
@@ -255,7 +252,8 @@ impl CsrSnapshot {
             .as_ref()
             .is_some_and(|weights| weights.iter().any(|w| *w < 0.0));
 
-        let (in_row_ptr, in_col_idx, in_pos) = Self::transpose(n, &row_ptr, &col_idx);
+        let (in_row_ptr, in_col_idx, in_edge_type, in_pos) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type);
 
         Ok(Self {
             row_ptr: row_ptr.into(),
@@ -266,6 +264,7 @@ impl CsrSnapshot {
             has_negative_weight,
             in_row_ptr: in_row_ptr.into(),
             in_col_idx: in_col_idx.into(),
+            in_edge_type: in_edge_type.into(),
             in_pos: in_pos.into(),
             dense_to_id: dense_to_id.into(),
             id_to_dense,
@@ -274,10 +273,15 @@ impl CsrSnapshot {
 
     /// Counting-sort transpose of the outgoing arrays into the incoming view.
     /// Walking the outgoing rows in ascending source order keeps each incoming
-    /// row ordered by ascending source dense index. The third array is the
-    /// outgoing position of each incoming entry, which is where its type and
-    /// id live.
-    fn transpose(n: usize, row_ptr: &[usize], col_idx: &[u32]) -> (Vec<usize>, Vec<u32>, Vec<u32>) {
+    /// row ordered by ascending source dense index. The last array is the
+    /// outgoing position of each incoming entry, which is where its id lives.
+    #[allow(clippy::type_complexity)]
+    fn transpose(
+        n: usize,
+        row_ptr: &[usize],
+        col_idx: &[u32],
+        edge_type: &[TypeId],
+    ) -> (Vec<usize>, Vec<u32>, Vec<TypeId>, Vec<u32>) {
         let total = col_idx.len();
         let mut in_row_ptr = vec![0usize; n + 1];
         for &dst_d in col_idx {
@@ -287,6 +291,7 @@ impl CsrSnapshot {
             in_row_ptr[i + 1] += in_row_ptr[i];
         }
         let mut in_col_idx = vec![0u32; total];
+        let mut in_edge_type = vec![0u32; total];
         let mut in_pos = vec![0u32; total];
         let mut cursor = in_row_ptr.clone();
         for src_d in 0..n {
@@ -294,10 +299,11 @@ impl CsrSnapshot {
                 let slot = cursor[col_idx[k] as usize];
                 cursor[col_idx[k] as usize] += 1;
                 in_col_idx[slot] = src_d as u32;
+                in_edge_type[slot] = edge_type[k];
                 in_pos[slot] = k as u32;
             }
         }
-        (in_row_ptr, in_col_idx, in_pos)
+        (in_row_ptr, in_col_idx, in_edge_type, in_pos)
     }
 
     /// This snapshot plus the nodes and edges of `change`, without reading the
@@ -426,7 +432,8 @@ impl CsrSnapshot {
         }
         debug_assert_eq!(next_add, adds.len());
 
-        let (in_row_ptr, in_col_idx, in_pos) = Self::transpose(n, &row_ptr, &col_idx);
+        let (in_row_ptr, in_col_idx, in_edge_type, in_pos) =
+            Self::transpose(n, &row_ptr, &col_idx, &edge_type);
 
         Ok(Some(Self {
             row_ptr: row_ptr.into(),
@@ -437,6 +444,7 @@ impl CsrSnapshot {
             has_negative_weight,
             in_row_ptr: in_row_ptr.into(),
             in_col_idx: in_col_idx.into(),
+            in_edge_type: in_edge_type.into(),
             in_pos: in_pos.into(),
             dense_to_id: dense_to_id.into(),
             id_to_dense,
@@ -947,6 +955,7 @@ mod snapshot_tests {
         edge_weight: Vec<f64>,
         in_row_ptr: Vec<usize>,
         in_col_idx: Vec<u32>,
+        in_edge_type: Vec<TypeId>,
         in_pos: Vec<u32>,
     }
 
@@ -1018,6 +1027,7 @@ mod snapshot_tests {
             in_row_ptr[i + 1] += in_row_ptr[i];
         }
         let mut in_col_idx = vec![0u32; total];
+        let mut in_edge_type = vec![0u32; total];
         let mut in_pos = vec![0u32; total];
         let mut cursor = in_row_ptr.clone();
         for src_d in 0..n {
@@ -1025,6 +1035,7 @@ mod snapshot_tests {
                 let slot = cursor[col_idx[k] as usize];
                 cursor[col_idx[k] as usize] += 1;
                 in_col_idx[slot] = src_d as u32;
+                in_edge_type[slot] = edge_type[k];
                 in_pos[slot] = k as u32;
             }
         }
@@ -1037,6 +1048,7 @@ mod snapshot_tests {
             edge_weight,
             in_row_ptr,
             in_col_idx,
+            in_edge_type,
             in_pos,
         }
     }
@@ -1067,6 +1079,7 @@ mod snapshot_tests {
         assert_eq!(got.has_negative_weight, want.has_negative_weight);
         assert_eq!(got.in_row_ptr, want.in_row_ptr);
         assert_eq!(got.in_col_idx, want.in_col_idx);
+        assert_eq!(got.in_edge_type, want.in_edge_type);
         assert_eq!(got.in_pos, want.in_pos);
     }
 
@@ -1328,6 +1341,7 @@ mod snapshot_tests {
                 prop_assert_eq!(got.has_negative_weight, want.has_negative_weight);
                 prop_assert_eq!(&got.in_row_ptr, &want.in_row_ptr);
                 prop_assert_eq!(&got.in_col_idx, &want.in_col_idx);
+                prop_assert_eq!(&got.in_edge_type, &want.in_edge_type);
                 prop_assert_eq!(&got.in_pos, &want.in_pos);
                 Ok(())
             };
@@ -1467,6 +1481,7 @@ mod snapshot_tests {
             prop_assert_eq!(snap.edge_weight.as_ref().map(|w| w.to_vec()), Some(want.edge_weight.clone()));
             prop_assert_eq!(&snap.in_row_ptr, &want.in_row_ptr);
             prop_assert_eq!(&snap.in_col_idx, &want.in_col_idx);
+            prop_assert_eq!(&snap.in_edge_type, &want.in_edge_type);
             prop_assert_eq!(&snap.in_pos, &want.in_pos);
 
             // The unweighted build must agree on everything except the weights it
@@ -1645,6 +1660,7 @@ mod snapshot_tests {
 
         assert_eq!(snap.in_row_ptr.len(), snap.dense_to_id.len() + 1);
         assert_eq!(snap.in_col_idx.len(), snap.col_idx.len());
+        assert_eq!(snap.in_edge_type.len(), snap.col_idx.len());
         assert_eq!(snap.in_pos.len(), snap.col_idx.len());
 
         let in_row = |d: usize| -> Vec<(u32, EdgeId)> {
@@ -1668,7 +1684,7 @@ mod snapshot_tests {
             .collect();
         for k in 0..snap.in_pos.len() {
             assert_eq!(
-                snap.in_edge_type(k),
+                snap.in_edge_type[k],
                 out_type[&snap.edge_id[snap.in_pos[k] as usize]]
             );
         }

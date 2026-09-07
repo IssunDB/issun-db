@@ -124,11 +124,12 @@ It is built at the smallest size its consumers read, and the build is memory-sha
   proptest pinning every array, incoming included, against the builder this replaced. The pass is a consequence of the stored layout: putting `edge_id`
   first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
   the order `out_neighbors` returns.
-- The incoming view carries no type or id arrays of its own. `in_pos[k]` is the outgoing position of the k-th incoming entry, so its type is
-  `edge_type[in_pos[k]]` (`CsrSnapshot::in_edge_type`) and its id `edge_id[in_pos[k]]`: four bytes per edge in place of twelve. A kernel scanning the
-  incoming view for structure alone (`in_row_ptr`, `in_col_idx`) never touches it; one that filters incoming entries by type pays one random read per
-  entry (`typed_neighbor_counts`, the two-hop `count_middles`). Do not reintroduce duplicated `in_edge_type` or `in_edge_id` arrays to save that read.
-  The 32-bit position caps a snapshot at `MAX_SNAPSHOT_EDGES`; a build past it is `Error::InvalidArgument`.
+- The incoming view carries its own type array (`in_edge_type`, a sequential read for a typed incoming scan) but no id array: `in_pos[k]` is the
+  outgoing position of the k-th incoming entry, so its id is `edge_id[in_pos[k]]`, four bytes per edge in place of eight, and only a rel-binding
+  expansion in the incoming direction reads it. Reading the type through `in_pos` was tried and doubled the two-hop count kernel's time (a random
+  read per incoming edge), and tallying typed in-degrees over the outgoing arrays was slower still (a scattered write per edge); do not remove
+  `in_edge_type`. `typed_neighbor_counts` does use the outgoing tally for a bulk incoming source set, where it was measured to win. The 32-bit
+  position caps a snapshot at `MAX_SNAPSHOT_EDGES`; a build past it is `Error::InvalidArgument`.
 - `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
   `shortest_path_dijkstra` is its only reader. Asking for it is sticky (`CsrCache::request_weights`), so a later unweighted refresh does not strip it out
   from under an alternating workload; the cost is eight bytes per edge held once anything asks a weighted question. Requesting Dijkstra against a
