@@ -213,32 +213,47 @@ fn spawn_statistics_warm_up(graph: Arc<Graph>) {
 
 async fn forward_stdio(
     input: impl tokio::io::AsyncRead + Unpin,
-    mut output: impl tokio::io::AsyncWrite + Unpin,
+    mut bridge_write: impl tokio::io::AsyncWrite + Unpin,
+    mut client_write: impl tokio::io::AsyncWrite + Unpin,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut input = BufReader::new(input);
     let mut line = Vec::new();
     while input.read_until(b'\n', &mut line).await? != 0 {
-        let discovery = serde_json::from_slice::<serde_json::Value>(&line)
-            .ok()
-            .is_some_and(|message| {
-                message.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
-                    && message.get("method").and_then(|v| v.as_str()) == Some("server/discover")
-                    && message.get("id").is_none()
-                    && message
-                        .get("params")
-                        .is_none_or(|v| v.is_object() || v.is_array())
-            });
-        if discovery {
-            line.clear();
-            continue;
+        if let Ok(message) = serde_json::from_slice::<serde_json::Value>(&line) {
+            let is_discovery = message.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+                && message.get("method").and_then(|v| v.as_str()) == Some("server/discover")
+                && message
+                    .get("params")
+                    .is_none_or(|v| v.is_object() || v.is_array());
+            if is_discovery {
+                if let Some(id) = message.get("id") {
+                    // Some MCP clients (like Antigravity)
+                    // probe capabilities with a `server/discover` request. Returning
+                    // Method Not Found (-32601) prompts the client to fall back to the
+                    // standard legacy `initialize` handshake.
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": "Method not found"
+                        }
+                    });
+                    let mut resp_bytes = serde_json::to_vec(&resp)?;
+                    resp_bytes.push(b'\n');
+                    client_write.write_all(&resp_bytes).await?;
+                }
+                line.clear();
+                continue;
+            }
         }
-        output.write_all(&line).await?;
-        tokio::io::copy(&mut input, &mut output).await?;
+        bridge_write.write_all(&line).await?;
+        tokio::io::copy(&mut input, &mut bridge_write).await?;
         break;
     }
-    output.shutdown().await
+    bridge_write.shutdown().await
 }
 
 #[tokio::main]
@@ -272,7 +287,9 @@ async fn main() -> anyhow::Result<()> {
             info!("serving MCP over stdio");
             let (client_read, bridge_write) = tokio::io::duplex(8192);
             tokio::spawn(async move {
-                if let Err(error) = forward_stdio(tokio::io::stdin(), bridge_write).await {
+                if let Err(error) =
+                    forward_stdio(tokio::io::stdin(), bridge_write, tokio::io::stdout()).await
+                {
                     warn!(%error, "stdio forwarding stopped");
                 }
             });
@@ -321,18 +338,22 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    async fn forwarded(input: &str) -> Vec<u8> {
+    async fn forwarded(input: &str) -> (Vec<u8>, Vec<u8>) {
         use tokio::io::AsyncReadExt;
 
-        let (mut read, write) = tokio::io::duplex(32);
-        let mut output = Vec::new();
-        let (sent, received) = tokio::join!(
-            forward_stdio(input.as_bytes(), write),
-            read.read_to_end(&mut output),
+        let (mut read_bridge, write_bridge) = tokio::io::duplex(128);
+        let (mut read_client, write_client) = tokio::io::duplex(128);
+        let mut output_bridge = Vec::new();
+        let mut output_client = Vec::new();
+        let (sent, r_bridge, r_client) = tokio::join!(
+            forward_stdio(input.as_bytes(), write_bridge, write_client),
+            read_bridge.read_to_end(&mut output_bridge),
+            read_client.read_to_end(&mut output_client),
         );
         sent.unwrap();
-        received.unwrap();
-        output
+        r_bridge.unwrap();
+        r_client.unwrap();
+        (output_bridge, output_client)
     }
 
     #[tokio::test]
@@ -343,14 +364,27 @@ mod tests {
         let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cypher_query","arguments":{"query":"RETURN $value","params":{"value":"server/discover"}}}}"#;
         let expected = format!("{initialize}{discovery}{call}\n");
         let input = format!("{discovery}{discovery}{expected}");
-        assert_eq!(forwarded(&input).await, expected.as_bytes());
+        let (bridge, client) = forwarded(&input).await;
+        assert_eq!(bridge, expected.as_bytes());
+        assert!(client.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_replies_method_not_found_to_discovery_requests() {
+        let discovery_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n";
+        let initialize =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\r\n";
+        let input = format!("{discovery_req}{initialize}");
+        let (bridge, client) = forwarded(&input).await;
+        assert_eq!(bridge, initialize.as_bytes());
+        let expected_resp =
+            "{\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1,\"jsonrpc\":\"2.0\"}\n";
+        assert_eq!(String::from_utf8(client).unwrap(), expected_resp);
     }
 
     #[tokio::test]
     async fn stdio_preserves_requests_data_and_invalid_frames() {
         for first in [
-            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
-            r#"{"jsonrpc":"2.0","id":null,"method":"server/discover"}"#,
             r#"{"jsonrpc":"2.0","method":"other","params":{"value":"server/discover"}}"#,
             r#"{"method":"server/discover"}"#,
             r#"{"jsonrpc":"2.0","method":"server/discover","params":null}"#,
@@ -358,13 +392,12 @@ mod tests {
         ] {
             let input =
                 format!("{first}\n{{\"jsonrpc\":\"2.0\",\"method\":\"server/discover\"}}\n");
-            assert_eq!(forwarded(&input).await, input.as_bytes());
+            let (bridge, _) = forwarded(&input).await;
+            assert_eq!(bridge, input.as_bytes());
         }
-        assert_eq!(
-            forwarded("no trailing newline").await,
-            b"no trailing newline"
-        );
-        assert!(forwarded("").await.is_empty());
+        let (bridge, _) = forwarded("no trailing newline").await;
+        assert_eq!(bridge, b"no trailing newline");
+        assert!(forwarded("").await.0.is_empty());
     }
 
     fn allowlist(hosts: &[&str]) -> HashSet<String> {
