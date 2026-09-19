@@ -2493,7 +2493,7 @@ fn print_stats(s: &GraphStats) {
         print_named_counts(&s.rel_types);
     }
 
-    println!("{}", "Indexes & Constraints".cyan().bold());
+    println!("{}", "Indexes and Constraints".cyan().bold());
     if s.node_indexes.is_empty() && s.edge_indexes.is_empty() {
         println!("  (none)");
     } else {

@@ -12,9 +12,8 @@ use clap::{Parser, ValueEnum};
 use issundb::Graph;
 use rmcp::{
     ServiceExt,
-    transport::{
-        stdio,
-        streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager},
+    transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
     },
 };
 use tracing::{info, warn};
@@ -212,6 +211,36 @@ fn spawn_statistics_warm_up(graph: Arc<Graph>) {
     }
 }
 
+async fn forward_stdio(
+    input: impl tokio::io::AsyncRead + Unpin,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut input = BufReader::new(input);
+    let mut line = Vec::new();
+    while input.read_until(b'\n', &mut line).await? != 0 {
+        let discovery = serde_json::from_slice::<serde_json::Value>(&line)
+            .ok()
+            .is_some_and(|message| {
+                message.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+                    && message.get("method").and_then(|v| v.as_str()) == Some("server/discover")
+                    && message.get("id").is_none()
+                    && message
+                        .get("params")
+                        .is_none_or(|v| v.is_object() || v.is_array())
+            });
+        if discovery {
+            line.clear();
+            continue;
+        }
+        output.write_all(&line).await?;
+        tokio::io::copy(&mut input, &mut output).await?;
+        break;
+    }
+    output.shutdown().await
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -241,7 +270,15 @@ async fn main() -> anyhow::Result<()> {
     match args.transport {
         Transport::Stdio => {
             info!("serving MCP over stdio");
-            let service = IssunMcp::new(graph).serve(stdio()).await?;
+            let (client_read, bridge_write) = tokio::io::duplex(8192);
+            tokio::spawn(async move {
+                if let Err(error) = forward_stdio(tokio::io::stdin(), bridge_write).await {
+                    warn!(%error, "stdio forwarding stopped");
+                }
+            });
+            let service = IssunMcp::new(graph)
+                .serve((client_read, tokio::io::stdout()))
+                .await?;
             service.waiting().await?;
         }
         Transport::Http => {
@@ -283,6 +320,52 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn forwarded(input: &str) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let (mut read, write) = tokio::io::duplex(32);
+        let mut output = Vec::new();
+        let (sent, received) = tokio::join!(
+            forward_stdio(input.as_bytes(), write),
+            read.read_to_end(&mut output),
+        );
+        sent.unwrap();
+        received.unwrap();
+        output
+    }
+
+    #[tokio::test]
+    async fn stdio_filters_only_leading_discovery_notifications() {
+        let discovery = "{\"jsonrpc\":\"2.0\",\"method\":\"server/discover\"}\n";
+        let initialize =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\r\n";
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cypher_query","arguments":{"query":"RETURN $value","params":{"value":"server/discover"}}}}"#;
+        let expected = format!("{initialize}{discovery}{call}\n");
+        let input = format!("{discovery}{discovery}{expected}");
+        assert_eq!(forwarded(&input).await, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn stdio_preserves_requests_data_and_invalid_frames() {
+        for first in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"server/discover"}"#,
+            r#"{"jsonrpc":"2.0","method":"other","params":{"value":"server/discover"}}"#,
+            r#"{"method":"server/discover"}"#,
+            r#"{"jsonrpc":"2.0","method":"server/discover","params":null}"#,
+            r#"{"method":"server/discover""#,
+        ] {
+            let input =
+                format!("{first}\n{{\"jsonrpc\":\"2.0\",\"method\":\"server/discover\"}}\n");
+            assert_eq!(forwarded(&input).await, input.as_bytes());
+        }
+        assert_eq!(
+            forwarded("no trailing newline").await,
+            b"no trailing newline"
+        );
+        assert!(forwarded("").await.is_empty());
+    }
 
     fn allowlist(hosts: &[&str]) -> HashSet<String> {
         hosts.iter().map(|h| h.to_string()).collect()

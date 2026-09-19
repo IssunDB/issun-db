@@ -1740,20 +1740,74 @@ pub(super) fn try_execute_vectorized(
             // graph lookup, while its expression semantics stay identical.
             let mut node_props: Vec<Vec<&str>> = vec![Vec::new(); p.chain_vars.len()];
             let mut edge_props: Vec<Vec<&str>> = vec![Vec::new(); p.expands.len()];
+            // Every property the root reads, and the subset an expression
+            // reads. An aggregate over a bare property (`SUM(be.pa)`) folds its
+            // gathered cell directly; only the group keys and the aggregates
+            // over expressions need the per-row variable binding, which costs a
+            // map with an owned key per property per row.
             let mut refs: Vec<(&str, &str)> = Vec::new();
+            let mut expr_refs: Vec<(&str, &str)> = Vec::new();
             for (e, _) in group_by.iter() {
                 collect_props(e, &mut refs);
+                collect_props(e, &mut expr_refs);
             }
+            let mut bare_of: Vec<Option<(&str, &str)>> = Vec::with_capacity(aggregations.len());
             for (_, inner, _) in aggregations.iter() {
                 collect_props(inner, &mut refs);
+                match inner {
+                    Expr::Prop(var, prop) if !prop.is_empty() => {
+                        bare_of.push(Some((var.as_str(), prop.as_str())));
+                    }
+                    _ => {
+                        collect_props(inner, &mut expr_refs);
+                        bare_of.push(None);
+                    }
+                }
             }
-            for (var, prop) in refs {
+            for (var, prop) in &refs {
                 if let Some(c) = col_of(&p.chain_vars, var) {
                     node_props[c].push(prop);
-                } else if let Some(h) = p.expands.iter().position(|ex| ex.rel_var == var) {
+                } else if let Some(h) = p.expands.iter().position(|ex| ex.rel_var == *var) {
                     edge_props[h].push(prop);
                 }
             }
+            // Whether a gathered cell is bound into the row's map: not at all
+            // for a bare-only property, moved for an expression-only one, and
+            // cloned when both an expression and a bare aggregate read it.
+            let in_map = |var: &str, prop: &str| expr_refs.contains(&(var, prop));
+            let node_in_map: Vec<Vec<bool>> = p
+                .chain_vars
+                .iter()
+                .enumerate()
+                .map(|(c, var)| node_props[c].iter().map(|pr| in_map(var, pr)).collect())
+                .collect();
+            let edge_in_map: Vec<Vec<bool>> = p
+                .expands
+                .iter()
+                .enumerate()
+                .map(|(h, ex)| {
+                    edge_props[h]
+                        .iter()
+                        .map(|pr| in_map(ex.rel_var, pr))
+                        .collect()
+                })
+                .collect();
+            // Per aggregate: the gathered cell of a bare property, as
+            // `(is_edge, table, column, shared)`.
+            let bare: Vec<Option<(bool, usize, usize, bool)>> = bare_of
+                .iter()
+                .map(|b| {
+                    let (var, prop) = (*b)?;
+                    if let Some(c) = col_of(&p.chain_vars, var) {
+                        let j = node_props[c].iter().position(|pr| *pr == prop)?;
+                        Some((false, c, j, node_in_map[c][j]))
+                    } else {
+                        let h = p.expands.iter().position(|ex| ex.rel_var == var)?;
+                        let j = edge_props[h].iter().position(|pr| *pr == prop)?;
+                        Some((true, h, j, edge_in_map[h][j]))
+                    }
+                })
+                .collect();
             let node_tables: Vec<Vec<Vec<Value>>> = (0..id_cols.len())
                 .map(|c| props_table(graph, &id_cols[c], &node_props[c]))
                 .collect::<Result<_, _>>()?;
@@ -1761,30 +1815,50 @@ pub(super) fn try_execute_vectorized(
                 .map(|h| edge_props_table(graph, &edge_cols[h], &edge_props[h]))
                 .collect::<Result<_, _>>()?;
 
-            // Bind one row's variables to scalar objects of their gathered
-            // properties (cells moved out, since each row is consumed once).
+            // Bind one row's expression-read variables to scalar objects of
+            // their gathered properties. A cell only an expression reads is
+            // moved out, since each row is consumed once; a cell a bare
+            // aggregate also folds is cloned and the fold takes the original.
             let bind_row = |i: usize,
                             node_tables: &mut Vec<Vec<Vec<Value>>>,
                             edge_tables: &mut Vec<Vec<Vec<Value>>>|
              -> SlotRow {
                 let mut row = SlotRow::empty(schema.clone());
                 for (c, var) in p.chain_vars.iter().enumerate() {
-                    if node_props[c].is_empty() {
+                    if !node_in_map[c].iter().any(|&m| m) {
                         continue;
                     }
                     let mut m = serde_json::Map::with_capacity(node_props[c].len());
                     for (j, prop) in node_props[c].iter().enumerate() {
-                        m.insert(prop.to_string(), std::mem::take(&mut node_tables[c][i][j]));
+                        if !node_in_map[c][j] {
+                            continue;
+                        }
+                        let shared = bare.iter().flatten().any(|b| *b == (false, c, j, true));
+                        let cell = if shared {
+                            node_tables[c][i][j].clone()
+                        } else {
+                            std::mem::take(&mut node_tables[c][i][j])
+                        };
+                        m.insert(prop.to_string(), cell);
                     }
                     row.bind_local(var, GraphBinding::Scalar(Value::Object(m)));
                 }
                 for (h, ex) in p.expands.iter().enumerate() {
-                    if edge_props[h].is_empty() {
+                    if !edge_in_map[h].iter().any(|&m| m) {
                         continue;
                     }
                     let mut m = serde_json::Map::with_capacity(edge_props[h].len());
                     for (j, prop) in edge_props[h].iter().enumerate() {
-                        m.insert(prop.to_string(), std::mem::take(&mut edge_tables[h][i][j]));
+                        if !edge_in_map[h][j] {
+                            continue;
+                        }
+                        let shared = bare.iter().flatten().any(|b| *b == (true, h, j, true));
+                        let cell = if shared {
+                            edge_tables[h][i][j].clone()
+                        } else {
+                            std::mem::take(&mut edge_tables[h][i][j])
+                        };
+                        m.insert(prop.to_string(), cell);
                     }
                     row.bind_local(ex.rel_var, GraphBinding::Scalar(Value::Object(m)));
                 }
@@ -1802,21 +1876,46 @@ pub(super) fn try_execute_vectorized(
                 let row = bind_row(i, &mut node_tables, &mut edge_tables);
 
                 let mut key_parts = Vec::with_capacity(group_by.len());
-                let mut gb_row = SlotRow::empty(schema.clone());
-                for (expr, alias) in group_by.iter() {
+                let mut key_vals = Vec::with_capacity(group_by.len());
+                for (expr, _) in group_by.iter() {
                     let val = evaluate_expr(graph, &row, expr, params)?;
-                    let col = group_by_column_name(expr, alias);
                     key_parts.push(canonical_cell_key(&val));
-                    gb_row.bind_local(&col, GraphBinding::Scalar(val));
+                    key_vals.push(val);
                 }
                 let group_key = key_parts.join("\x00");
+                // The group's row is built once, when its key is first seen.
                 let entry = groups.entry(group_key).or_insert_with(|| {
+                    let mut gb_row = SlotRow::empty(schema.clone());
+                    for ((expr, alias), val) in group_by.iter().zip(key_vals) {
+                        let col = group_by_column_name(expr, alias);
+                        gb_row.bind_local(&col, GraphBinding::Scalar(val));
+                    }
                     let states = aggregations.iter().map(|_| AggState::new()).collect();
                     (gb_row, states)
                 });
                 for (k, (agg_fn, inner, _)) in aggregations.iter().enumerate() {
                     let state = &mut entry.1[k];
-                    if matches!(agg_fn, AggFn::Count { .. }) && matches!(inner, Expr::CountStar) {
+                    if let Some((is_edge, t, j, _)) = bare[k] {
+                        // The last bare aggregate over a cell takes it; earlier
+                        // ones (`SUM(r.x)` beside `AVG(r.x)`) clone.
+                        let last_reader = bare[k + 1..]
+                            .iter()
+                            .flatten()
+                            .all(|b| (b.0, b.1, b.2) != (is_edge, t, j));
+                        let slot = if is_edge {
+                            &mut edge_tables[t][i][j]
+                        } else {
+                            &mut node_tables[t][i][j]
+                        };
+                        let cell = if last_reader {
+                            std::mem::take(slot)
+                        } else {
+                            slot.clone()
+                        };
+                        state.fold(agg_fn, cell);
+                    } else if matches!(agg_fn, AggFn::Count { .. })
+                        && matches!(inner, Expr::CountStar)
+                    {
                         state.fold_count_star();
                     } else {
                         let val = evaluate_expr(graph, &row, inner, params)?;
@@ -2730,6 +2829,23 @@ mod tests {
             "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
              RETURN SUM(be.pa + be.hr) AS total, \
                     SUM(CASE WHEN be.bathand = pe.pithand THEN 1 ELSE 0 END) AS same_hand",
+        );
+    }
+
+    #[test]
+    fn general_aggregate_shared_cells_match_row_path() {
+        let (_dir, g) = edge_prop_fixture();
+        // One gathered cell feeds two bare aggregates (SUM and AVG of be.pa)
+        // and the same property also appears inside an expression, so the
+        // fold must clone the cell until its last reader takes it.
+        assert_matches_row_path(
+            &g,
+            "MATCH (:Player)-[be:BATTED]->(e:Event)<-[pe:PITCHED]-(:Player) \
+             WITH pe.pithand AS ph, \
+                  SUM(be.pa) AS pa, AVG(be.pa) AS mean_pa, MIN(be.pa) AS min_pa, \
+                  SUM(be.pa * 2 + be.hr) AS weighted, \
+                  collect(be.hr) AS hrs, count(e.run_b) AS scored \
+             RETURN ph, pa, mean_pa, min_pa, weighted, size(hrs) AS n_hr, scored ORDER BY ph",
         );
     }
 

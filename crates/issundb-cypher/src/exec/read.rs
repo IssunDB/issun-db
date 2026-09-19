@@ -1587,6 +1587,19 @@ pub(super) fn dedup_records(records: &mut Vec<Record>) {
     records.retain(|r| seen.insert(canonical_row_key(&r.values)));
 }
 
+#[cfg(test)]
+mod canonical_key_tests {
+    use super::*;
+
+    #[test]
+    fn composite_keys_escape_control_characters_in_strings() {
+        let left = [serde_json::json!("a\u{0}J\"b"), serde_json::json!("c")];
+        let right = [serde_json::json!("a"), serde_json::json!("b\u{0}J\"c")];
+
+        assert_ne!(canonical_row_key(&left), canonical_row_key(&right));
+    }
+}
+
 /// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
 fn filter_expr_to_where_clause(expression: &FilterExpr) -> WhereClause {
     match expression {

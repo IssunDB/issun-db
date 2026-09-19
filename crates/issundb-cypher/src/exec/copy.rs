@@ -66,6 +66,9 @@ pub(super) fn execute_copy(
     graph
         .materialize_property_columns()
         .map_err(|e| format!("failed to build property columns after import: {}", e))?;
+    graph
+        .materialize_edge_property_columns()
+        .map_err(|e| format!("failed to build edge property columns after import: {}", e))?;
 
     Ok(QueryResult {
         statement_count: 1,
@@ -987,6 +990,9 @@ pub(super) fn execute_import_db(
     graph
         .materialize_property_columns()
         .map_err(|e| format!("failed to build property columns after import: {}", e))?;
+    graph
+        .materialize_edge_property_columns()
+        .map_err(|e| format!("failed to build edge property columns after import: {}", e))?;
 
     // One row per COPY statement, so a file that ingested zero rows or
     // classified unexpectedly is visible to the caller.

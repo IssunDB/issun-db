@@ -179,7 +179,10 @@ The `VecRoot` variants escalate in generality:
 - `AggregateGeneral`: group keys or aggregate inputs are general scalar expressions (CASE, arithmetic, comparisons, IS NULL, function calls) over
   chain node and relationship variables, including edge properties. It binds each row's node and edge ids and folds through the shared `evaluate_expr`
   and `AggState`, so its semantics match the row pipeline exactly. `agg_expr_eligible` gates which expressions qualify; anything it declines stays on
-  the row pipeline, so correctness never depends on the gate.
+  the row pipeline, so correctness never depends on the gate. Only the group keys and the aggregates over expressions bind the row's variables; an
+  aggregate over a bare property (`SUM(be.pa)`) folds its gathered cell directly, the last such reader taking the cell and earlier ones cloning it.
+  A group's row is built once, when its key is first seen. These changes avoid per-row property maps for bare aggregates and repeated group-row
+  construction. Their effect on query latency requires workload-specific benchmarks.
 
 Both aggregate roots read properties from the in-memory columnar store (see "In-memory Property Columns" in `issundb-core/AGENTS.md`): one bulk gather
 of every referenced `(variable, property)` column per query rather than a point read per row. Every vectorized shape must be covered by a differential
