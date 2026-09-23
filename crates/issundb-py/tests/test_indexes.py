@@ -103,7 +103,6 @@ def test_set_thread_count_is_accepted(db):
 def test_label_management(db):
     nid = db.add_node("Person", json.dumps({"name": "Ada"}))
     db.add_label(nid, "Admin")
-    # Verify via Cypher
     res = json.loads(db.query("MATCH (n:Admin) RETURN n.name AS name"))
     assert ["Ada"] in [r["values"] for r in res["records"]]
 

@@ -23,7 +23,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Open a temporary database
     let dir = TempDir::new()?;
     let graph = Graph::open(dir.path(), 1)?;
 
@@ -123,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while running_writer.load(std::sync::atomic::Ordering::Relaxed) {
             step += 1;
 
-            // 1. Update existing sensor readings
+            // Update existing sensor readings
             let temp_a = 20.0 + (step as f64 * 0.3).sin() * 5.0;
             let temp_b = 18.0 + (step as f64 * 0.4).cos() * 3.0;
 
@@ -140,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[Writer] Failed to update Sensor B: {:?}", e);
             }
 
-            // 2. Every 10 steps, add a temporary sensor and delete it 5 steps later
+            // Every 10 steps, add a temporary sensor and delete it 5 steps later
             if step % 10 == 0 {
                 let sensor_id = format!("C-{}", step);
                 println!("[Writer] Adding new Sensor {}...", sensor_id);

@@ -15,15 +15,12 @@ use std::collections::HashMap;
 use tempfile::TempDir;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Open a temporary database
     let dir = TempDir::new()?;
     let graph = Graph::open(dir.path(), 1)?;
 
     println!("IssunDB Graph Analytics Showcase");
     println!("===============================\n");
 
-    // 2. Populate a synthetic social/technology network
-    // Let's create some Developer nodes
     let developers = [
         ("Alice", "Rust Developer"),
         ("Bob", "Python Developer"),
@@ -46,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Created Developer node {:?}: {}", id, name);
     }
 
-    // Let's create some Project nodes
     let projects = [
         ("IssunDB", "Graph Database"),
         ("Mochi-Web", "Web Framework"),

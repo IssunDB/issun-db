@@ -481,8 +481,8 @@ fn execute_read_query_impl(
     };
     let optimized: &PhysicalOperator = &optimized;
 
-    // 2. Execute the optimized physical operator tree recursively.
-    //    The top-level `PhysicalOperator::Project` in the plan has already
+    // Execute the optimized physical operator tree recursively.
+    // The top-level `PhysicalOperator::Project` in the plan has already
     //    materialized all projected values into the row under their canonical
     //    column-name keys. Reading by key here avoids a second evaluation of the
     //    same expressions (double-projection) against a row that no longer
@@ -564,7 +564,7 @@ fn execute_read_query_impl(
     let is_return_star = query.return_clause.items.len() == 1
         && crate::parser::is_star_item(&query.return_clause.items[0]);
 
-    // 3. Derive column names. For RETURN *, use all keys from the first resolved path.
+    // Derive column names. For RETURN *, use all keys from the first resolved path.
     let columns: Vec<String> = if is_return_star {
         // Collect and sort keys from the first path for deterministic column
         // ordering, excluding planner-generated bindings (`_rel_N_M` for an
@@ -643,7 +643,7 @@ fn execute_read_query_impl(
         query.return_clause.items.iter().map(column_name).collect()
     };
 
-    // 4. Read each projected value directly from the row by its canonical key.
+    // Read each projected value directly from the row by its canonical key.
     //
     // For RETURN DISTINCT *, deduplicate by binding identity (node and edge id,
     // or canonical scalar value) rather than by the materialized property

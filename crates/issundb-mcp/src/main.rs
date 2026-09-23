@@ -229,10 +229,9 @@ async fn forward_stdio(
                     .is_none_or(|v| v.is_object() || v.is_array());
             if is_discovery {
                 if let Some(id) = message.get("id") {
-                    // Some MCP clients (like Antigravity)
-                    // probe capabilities with a `server/discover` request. Returning
-                    // Method Not Found (-32601) prompts the client to fall back to the
-                    // standard legacy `initialize` handshake.
+                    // Some MCP clients probe capabilities with a `server/discover`
+                    // request. Returning Method Not Found (-32601) prompts the client
+                    // to fall back to the standard `initialize` handshake.
                     let resp = serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -371,14 +370,14 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_replies_method_not_found_to_discovery_requests() {
-        let discovery_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n";
+        let discovery_req =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n";
         let initialize =
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\r\n";
         let input = format!("{discovery_req}{initialize}");
         let (bridge, client) = forwarded(&input).await;
         assert_eq!(bridge, initialize.as_bytes());
-        let expected_resp =
-            "{\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1,\"jsonrpc\":\"2.0\"}\n";
+        let expected_resp = "{\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":1,\"jsonrpc\":\"2.0\"}\n";
         assert_eq!(String::from_utf8(client).unwrap(), expected_resp);
     }
 

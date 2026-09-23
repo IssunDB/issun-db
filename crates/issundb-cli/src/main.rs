@@ -4025,7 +4025,7 @@ mod tests {
         ));
         assert!(restored.exists());
 
-        // 4h. Close releases the open database without exiting; a second close
+        // Close releases the open database without exiting; a second close
         // is a no-op against the now-empty state.
         assert!(state.graph.is_some());
         assert!(handle(&mut state, ":close"));

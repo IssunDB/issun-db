@@ -57,11 +57,11 @@ pub(super) fn execute_copy(
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
-    // A bulk load also pays the node property column build, which persists the
-    // columns cache file beside the CSR one, so a later process's first
-    // aggregation loads both instead of scanning. The columns' memory in this
-    // process is the price, and a bulk load is the one caller entitled to that
-    // decision: it just declared the graph worth ingesting whole, unlike a
+    // A bulk load also pays the node and relationship property column builds,
+    // which persist their cache files beside the CSR one, so a later process's
+    // first aggregation loads them instead of scanning. The columns' memory in
+    // this process is the price, and a bulk load is the one caller entitled to
+    // that decision: it just declared the graph worth ingesting whole, unlike a
     // server start or a query, neither of which warms columns.
     graph
         .materialize_property_columns()
@@ -135,7 +135,7 @@ pub(super) fn execute_copy_internal(
     };
     let headers_found = source.csv_headers().unwrap_or(&[]);
 
-    // 3. Determine if it is a relationship import. Only the underscore-prefixed
+    // Determine if it is a relationship import. Only the underscore-prefixed
     // metadata keys classify: a node whose user properties happen to be named
     // `from` and `to` must import as a node, not as an edge file.
     let is_relationship = if inferred_format == "csv" {
@@ -493,7 +493,6 @@ pub(super) fn execute_export_db(
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("failed to create export directory: {}", e))?;
 
-    // Export nodes
     let all_nodes = graph.all_nodes().map_err(|e| e.to_string())?;
 
     let nodes_file_name = if format == "csv" {
@@ -629,7 +628,6 @@ pub(super) fn execute_export_db(
         }
     }
 
-    // Export edges
     let edges_file_name = if format == "csv" {
         "edges.csv"
     } else if format == "parquet" {
@@ -980,10 +978,10 @@ pub(super) fn execute_import_db(
         }
     }
 
-    // 4. Rebuild CSR snapshot once at the end of the entire import process,
-    // and build the node property columns with it; see `execute_copy` for the
-    // policy. Both persist their cache files, so the imported database reopens
-    // without either scan.
+    // Rebuild CSR snapshot once at the end of the entire import process, and
+    // build the node and relationship property columns with it; see
+    // `execute_copy` for the policy. They persist their cache files, so the
+    // imported database reopens without scanning.
     graph
         .rebuild_csr()
         .map_err(|e| format!("failed to rebuild CSR after import: {}", e))?;
