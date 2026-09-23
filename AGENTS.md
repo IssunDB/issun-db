@@ -71,7 +71,7 @@ section, and a public method's contract lives under Component APIs. Do not inven
       always-on auto-index; a relationship `CREATE INDEX` provisions the property index.
     - `src/exec/copy.rs`: `COPY ... FROM`, `EXPORT DATABASE`, and `IMPORT DATABASE`. An import streams rows into one transaction as they decode; do
       not reintroduce a collect-then-write pass, which held every row on the heap at bulk-load scale. Both import entry points end with `rebuild_csr`
-      and `materialize_property_columns`, so the imported database reopens without either scan.
+      and both `materialize_*_columns` builders, so the imported database reopens without any of the three scans.
 - `crates/issundb-vector/`: the vector index behind `backend.rs`, selected at compile time from the default-on `hnsw` feature: `usearch` (the
   workspace's only C++ dependency) or a pure-Rust exact scan. The fallback is exact rather than a stub, so one suite proves both (crate guide, "The
   Backend Seam").

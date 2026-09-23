@@ -141,7 +141,7 @@ These methods are the Rust equivalents of the Cypher DDL statements in the [Cyph
 
 The query optimizer's cardinality statistics are built only when asked for. No ordinary query builds them as a side effect, because each is a full scan
 and paying for it on the first query that mentions a property or a relationship pattern was the dominant cold-start cost; the one exception is a bulk
-import (`COPY ... FROM` or `IMPORT DATABASE`), which ends by building and persisting the node property columns. A process that never calls these plans
+import (`COPY ... FROM` or `IMPORT DATABASE`), which ends by building and persisting the node and edge property columns. A process that never calls these plans
 every relationship pattern on the global average fan-out and gets no selectivity estimates; the answers are advisory, so plans are weighted differently
 but results never change.
 
@@ -154,7 +154,7 @@ but results never change.
 
 The CLI performs the first of these on every open (pass `--no-warm-statistics` to skip it), and so do the REST and MCP servers, on a background thread. The
 Python and Rust surfaces leave the warm-ups to the caller, with one exception: a bulk import (`COPY ... FROM` or `IMPORT DATABASE`) ends by building and
-persisting the node property columns, so a process that just imported already has them.
+persisting the node and edge property columns, so a process that just imported already has them.
 
 ---
 

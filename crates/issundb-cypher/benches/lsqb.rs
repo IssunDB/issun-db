@@ -58,12 +58,12 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
     .unwrap();
 
     g.update(|txn| {
-        // 5. Connect Persons with LIVES_IN to Cities (deterministic)
+        // Connect Persons with LIVES_IN to Cities (deterministic)
         for i in 0..NUM_PERSONS {
             txn.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))?;
         }
 
-        // 6. Connect Persons with KNOWS (coprime offsets to form loops/traversals)
+        // Connect Persons with KNOWS (coprime offsets to form loops/traversals)
         let knows_offsets = [1, 7, 13];
         for i in 0..NUM_PERSONS {
             for off in knows_offsets {
@@ -76,7 +76,7 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
             }
         }
 
-        // 7. Add directed triangles and reciprocal pairs. These make cycle and
+        // Add directed triangles and reciprocal pairs. These make cycle and
         // endpoint-inequality predicates exercise both matching and rejected rows.
         for base in (700..997).step_by(3) {
             txn.add_edge(persons[base + 2], persons[base], "KNOWS", &json!({}))?;
@@ -98,7 +98,7 @@ fn build_lsqb_graph() -> (TempDir, Graph) {
             )?;
         }
 
-        // 9. Create three comment cohorts: known creators, unknown creators, and
+        // Create three comment cohorts: known creators, unknown creators, and
         // comments without an author. Posts 1 through 502 form the Q7 anchor set.
         for i in 0..500 {
             txn.add_edge(comments[i], persons[i], "HAS_CREATOR", &json!({}))?;

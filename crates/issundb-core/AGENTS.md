@@ -220,7 +220,9 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
 - The whole-graph build streams: `ColumnSource::for_each` hands each entity's decoded properties to the per-property `ColumnBuilder`s and drops them
   before the next entity is read. Do not reintroduce a collect-everything scan (the old `scan_all`); holding every entity's `Value` until the end
   peaked at three times the finished columns' size on a million-node graph. A builder picks the tightest kind from the first non-null value and
-  degrades to `Json` at the first value of another kind, exactly as a patch does. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
+  degrades to `Json` at the first value of another kind, exactly as a patch does. A property with no non-null value finishes as an all-null `Int` column
+  with a zero presence bitmap and an integer array that can be mapped on load. This reduces heap usage and avoids decoding `n` msgpack nils on load,
+  but increases the cache payload from about one byte per slot to eight bytes per slot plus the bitmap. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
   beside the columns and invalidated by the same post-commit patch.
 - `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
   request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent

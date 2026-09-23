@@ -160,11 +160,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Neo4j to IssunDB Migration Demo");
     println!("================================\n");
 
-    // ---- 2. Open an IssunDB graph ------------------------------------------
+    // ---- Open an IssunDB graph --------------------------------------------
     let dir = TempDir::new()?;
     let graph = Graph::open(dir.path(), 1)?;
 
-    // ---- 3. Import nodes ---------------------------------------------------
+    // ---- Import nodes -----------------------------------------------------
     // Map from Neo4j node ID to IssunDB NodeId so we can wire up edges.
     let mut id_map: HashMap<u64, issundb::NodeId> = HashMap::new();
 
@@ -181,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Imported {:?}: {}", issun_id, name);
     }
 
-    // ---- 3. Import edges ---------------------------------------------------
+    // ---- Import edges -----------------------------------------------------
     let edges = sample_edges();
     println!("\nImporting {} KNOWS edges...", edges.len());
     for neo_edge in &edges {
@@ -198,13 +198,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional: rebuild CSR snapshot manually after bulk writes
     graph.rebuild_csr()?;
 
-    // ---- 4. Verify the import by running a Cypher query --------------------------
+    // ---- Verify the import by running a Cypher query ----------------------
     println!(
         "\n--- Cypher verification: MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name ---"
     );
     let result = graph.query("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")?;
 
-    // ---- 5. Print the result table -----------------------------------------
+    // ---- Print the result table -------------------------------------------
     println!("{:<20} {:<20}", "from", "to");
     println!("{}", "-".repeat(42));
     for record in &result.records {

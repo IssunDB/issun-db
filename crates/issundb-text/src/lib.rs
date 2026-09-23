@@ -878,7 +878,7 @@ mod tests {
         let temp = TempDir::new()?;
         let graph = Graph::open(temp.path(), 1)?;
 
-        // 1. Insert documents before index is created
+        // Insert documents before index is created
         let n1 = graph.add_node(
             "Movie",
             &json!({
@@ -895,7 +895,7 @@ mod tests {
             "description": "A tragic love story on a ship that hits an iceberg and sinks in the ocean"
         }))?;
 
-        // 2. Search should return IndexNotFound before index is created
+        // Search should return IndexNotFound before index is created
         let opts = TextSearchOptions {
             label: Some("Movie".to_string()),
             property: Some("description".to_string()),
@@ -912,7 +912,7 @@ mod tests {
         graph.create_node_text_index("Movie", "description")?;
         assert!(graph.has_node_text_index("Movie", "description")?);
 
-        // 4. Single-term search: BM25 length normalization makes shorter doc rank higher.
+        // Single-term search: BM25 length normalization makes shorter doc rank higher.
         // "space" appears in n1 (1 time) and n2 (1 time).
         // n1 is shorter (9 words) so it has a higher BM25 score than n2 (12 words).
         let hits_space = graph.text_search("space", &opts)?;
@@ -924,7 +924,7 @@ mod tests {
             "Shorter document should score higher"
         );
 
-        // 5. Multi-term search: "spaceship battle" should score n2 highest because
+        // Multi-term search: "spaceship battle" should score n2 highest because
         //    "battle" appears twice in n2, while n1 has neither "battle" nor more "spaceship".
         let hits_multi = graph.text_search("spaceship battle", &opts)?;
         assert_eq!(hits_multi[0].node, n2);
@@ -1176,7 +1176,6 @@ mod tests {
         let title_idx = list.iter().find(|(_, p, _)| p == "title").unwrap();
         assert_eq!(title_idx.2, Language::German);
 
-        // Drop the indexes
         graph.drop_text_index("Doc", "body")?;
         assert!(!graph.has_text_index("Doc", "body")?);
 

@@ -481,8 +481,8 @@ fn execute_read_query_impl(
     };
     let optimized: &PhysicalOperator = &optimized;
 
-    // 2. Execute the optimized physical operator tree recursively.
-    //    The top-level `PhysicalOperator::Project` in the plan has already
+    // Execute the optimized physical operator tree recursively.
+    // The top-level `PhysicalOperator::Project` in the plan has already
     //    materialized all projected values into the row under their canonical
     //    column-name keys. Reading by key here avoids a second evaluation of the
     //    same expressions (double-projection) against a row that no longer
@@ -564,7 +564,7 @@ fn execute_read_query_impl(
     let is_return_star = query.return_clause.items.len() == 1
         && crate::parser::is_star_item(&query.return_clause.items[0]);
 
-    // 3. Derive column names. For RETURN *, use all keys from the first resolved path.
+    // Derive column names. For RETURN *, use all keys from the first resolved path.
     let columns: Vec<String> = if is_return_star {
         // Collect and sort keys from the first path for deterministic column
         // ordering, excluding planner-generated bindings (`_rel_N_M` for an
@@ -643,7 +643,7 @@ fn execute_read_query_impl(
         query.return_clause.items.iter().map(column_name).collect()
     };
 
-    // 4. Read each projected value directly from the row by its canonical key.
+    // Read each projected value directly from the row by its canonical key.
     //
     // For RETURN DISTINCT *, deduplicate by binding identity (node and edge id,
     // or canonical scalar value) rather than by the materialized property
@@ -1585,6 +1585,19 @@ fn edge_list_key(ids: impl Iterator<Item = EdgeId>) -> String {
 pub(super) fn dedup_records(records: &mut Vec<Record>) {
     let mut seen = std::collections::HashSet::new();
     records.retain(|r| seen.insert(canonical_row_key(&r.values)));
+}
+
+#[cfg(test)]
+mod canonical_key_tests {
+    use super::*;
+
+    #[test]
+    fn composite_keys_escape_control_characters_in_strings() {
+        let left = [serde_json::json!("a\u{0}J\"b"), serde_json::json!("c")];
+        let right = [serde_json::json!("a"), serde_json::json!("b\u{0}J\"c")];
+
+        assert_ne!(canonical_row_key(&left), canonical_row_key(&right));
+    }
 }
 
 /// Convert a `FilterExpr` to the `WhereClause` representation used by `evaluate_where`.
