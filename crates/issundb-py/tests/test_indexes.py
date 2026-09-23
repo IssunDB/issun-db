@@ -1,7 +1,7 @@
 """Tests for index administration and filtered search across the binding boundary.
 
 Covers vector index configuration and reindexing, vector search filters, the
-full-text index language argument and listing, and GraphBLAS thread control.
+full-text index language argument and listing, and parallel thread control.
 """
 
 import json

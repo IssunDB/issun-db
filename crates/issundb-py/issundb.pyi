@@ -453,7 +453,7 @@ class IssunDB:
         ...
 
     def set_thread_count(self, n: int) -> None:
-        """Set the GraphBLAS thread count (0 restores the default).
+        """Set the thread count for the parallel read passes (0 restores default behavior).
 
         Args:
             n: The number of threads.

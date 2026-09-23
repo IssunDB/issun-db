@@ -235,9 +235,7 @@ CREATE, SET, DELETE, and MERGE all mutate the graph:
   one `Graph::update` already holds. A debug assertion catches that mistake at the call site. Never call `Storage` from the `exec` module.
 - Do not rebuild the CSR snapshot by hand. `Graph::update` publishes the write to the caches' freshness counters at commit, and each consumer's gate
   rebuilds what it needs on demand (see the freshness gates in the root `AGENTS.md`).
-- A `MATCH` or scan *after* a write clause in the same statement does not see that write's structural effect, because it reads the committed-only label
-  index and CSR snapshot rather than the open transaction. A `RETURN`/`WITH` reading a property of a variable the statement just wrote does see it,
-  through the pending-writes overlay in `exec/expr.rs`.
+- A `MATCH` or scan after a write clause in the same statement sees that write's structural effect through the open transaction, matching openCypher clause ordering.
 
 ## Statement Clock
 
