@@ -230,6 +230,8 @@ CREATE, SET, DELETE, and MERGE all mutate the graph:
 
 - A single statement's write clauses, and the `RETURN`/`WITH` projection that follows them, share one `Graph::update` transaction, so an error anywhere
   rolls back every write the statement already made. Do not open a second transaction inside a statement.
+- MERGE validates computed properties on the creation path too, so an unmatched prefix cannot hide a null property on a later element.
+- Whole-map SET replacement and merge validate each property's value through the same check as a single-property assignment, for both nodes and edges.
 - Mutate through the `WriteTxn` methods on the open transaction (`txn.add_node`, `txn.add_edge`, `txn.update_node`, `txn.delete_node`,
   `txn.delete_edge`), not through the auto-committing `Graph` methods of the same name: those open their own transaction and would deadlock against the
   one `Graph::update` already holds. A debug assertion catches that mistake at the call site. Never call `Storage` from the `exec` module.

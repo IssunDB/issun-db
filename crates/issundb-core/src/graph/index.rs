@@ -365,17 +365,19 @@ impl Graph {
             )
         };
         if let Some(encoded) = encode_property_value(val) {
-            let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-            prefix.extend_from_slice(&type_id.to_be_bytes());
-            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-            prefix.extend_from_slice(&encoded);
-            for entry in self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)? {
-                let (key, _) = entry?;
-                // Only an exact encoded-value match conflicts; a prefix-only
-                // match is a distinct string value (see `exact_prop_index_id`).
-                if let Some(found_edge_id) = exact_prop_index_id(key, &encoded) {
-                    if found_edge_id != edge_id {
-                        return Err(violation());
+            for encoding in property_lookup_encodings(&encoded) {
+                let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+                prefix.extend_from_slice(&type_id.to_be_bytes());
+                prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+                prefix.extend_from_slice(encoding);
+                for entry in self.storage.edge_prop_idx.prefix_iter(wtxn, &prefix)? {
+                    let (key, _) = entry?;
+                    // Only an exact encoded-value match conflicts; a prefix-only
+                    // match is a distinct string value (see `exact_prop_index_id`).
+                    if let Some(found_edge_id) = exact_prop_index_id(key, encoding) {
+                        if found_edge_id != edge_id {
+                            return Err(violation());
+                        }
                     }
                 }
             }
@@ -624,11 +626,14 @@ impl Graph {
 
             if let Some(val) = prop_val {
                 if flags == 0x01 && val != &serde_json::Value::Null {
-                    let key = encode_property_value(val).unwrap_or_else(|| {
+                    let mut key = encode_property_value(val).unwrap_or_else(|| {
                         let mut k = vec![0xFF];
                         k.extend_from_slice(val.to_string().as_bytes());
                         k
                     });
+                    if key == NEGATIVE_ZERO_ENCODING {
+                        key.copy_from_slice(&POSITIVE_ZERO_ENCODING);
+                    }
                     if !seen_values.insert(key) {
                         return Err(Error::UniqueConstraintViolation(
                             label.to_string(),
@@ -812,11 +817,14 @@ impl Graph {
 
             if let Some(val) = prop_val {
                 if flags == 0x01 && val != &serde_json::Value::Null {
-                    let key = encode_property_value(val).unwrap_or_else(|| {
+                    let mut key = encode_property_value(val).unwrap_or_else(|| {
                         let mut k = vec![0xFF];
                         k.extend_from_slice(val.to_string().as_bytes());
                         k
                     });
+                    if key == NEGATIVE_ZERO_ENCODING {
+                        key.copy_from_slice(&POSITIVE_ZERO_ENCODING);
+                    }
                     if !seen_values.insert(key) {
                         return Err(Error::UniqueConstraintViolation(
                             etype.to_string(),
@@ -968,21 +976,26 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-        prefix.extend_from_slice(&label_id.to_be_bytes());
-        prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-        prefix.extend_from_slice(&encoded);
-
         let mut result = Vec::new();
-        for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
-            let (key, _) = entry?;
-            // A prefix match on the encoded value is not enough: the
-            // NUL-terminated string encoding lets a lookup for "a" prefix-match a
-            // stored "a\0", so require the value segment to equal `encoded`
-            // exactly.
-            if let Some(node_id) = exact_prop_index_id(key, &encoded) {
-                result.push(node_id);
+        for encoding in property_lookup_encodings(&encoded) {
+            let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+            prefix.extend_from_slice(&label_id.to_be_bytes());
+            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+            prefix.extend_from_slice(encoding);
+
+            for entry in self.storage.node_prop_idx.prefix_iter(rtxn, &prefix)? {
+                let (key, _) = entry?;
+                // A prefix match on the encoded value is not enough: the
+                // NUL-terminated string encoding lets a lookup for "a" prefix-match a
+                // stored "a\0", so require the value segment to equal `encoded`
+                // exactly.
+                if let Some(node_id) = exact_prop_index_id(key, encoding) {
+                    result.push(node_id);
+                }
             }
+        }
+        if normalized_property_encoding(&encoded) == POSITIVE_ZERO_ENCODING {
+            result.sort_unstable();
         }
         Ok(result)
     }
@@ -1436,19 +1449,27 @@ impl Graph {
                 }
                 if let Some(ref min_enc) = min_encoded {
                     if min_inclusive {
-                        if val_bytes < min_enc.as_slice() {
+                        if normalized_property_encoding(val_bytes)
+                            < normalized_property_encoding(min_enc)
+                        {
                             continue;
                         }
-                    } else if val_bytes <= min_enc.as_slice() {
+                    } else if normalized_property_encoding(val_bytes)
+                        <= normalized_property_encoding(min_enc)
+                    {
                         continue;
                     }
                 }
                 if let Some(ref max_enc) = max_encoded {
                     if max_inclusive {
-                        if val_bytes > max_enc.as_slice() {
+                        if normalized_property_encoding(val_bytes)
+                            > normalized_property_encoding(max_enc)
+                        {
                             continue;
                         }
-                    } else if val_bytes >= max_enc.as_slice() {
+                    } else if normalized_property_encoding(val_bytes)
+                        >= normalized_property_encoding(max_enc)
+                    {
                         continue;
                     }
                 }
@@ -1553,20 +1574,25 @@ impl Graph {
             None => return Ok(Vec::new()),
         };
 
-        let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
-        prefix.extend_from_slice(&type_id.to_be_bytes());
-        prefix.extend_from_slice(&prop_key_id.to_be_bytes());
-        prefix.extend_from_slice(&encoded);
-
         let mut result = Vec::new();
-        for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
-            let (key, _) = entry?;
-            // Require an exact encoded-value match, not just a prefix, so a
-            // stored "a\0" is not returned for a lookup of "a" (see
-            // `exact_prop_index_id`).
-            if let Some(edge_id) = exact_prop_index_id(key, &encoded) {
-                result.push(edge_id);
+        for encoding in property_lookup_encodings(&encoded) {
+            let mut prefix = Vec::with_capacity(4 + 4 + encoded.len());
+            prefix.extend_from_slice(&type_id.to_be_bytes());
+            prefix.extend_from_slice(&prop_key_id.to_be_bytes());
+            prefix.extend_from_slice(encoding);
+
+            for entry in self.storage.edge_prop_idx.prefix_iter(rtxn, &prefix)? {
+                let (key, _) = entry?;
+                // Require an exact encoded-value match, not just a prefix, so a
+                // stored "a\0" is not returned for a lookup of "a" (see
+                // `exact_prop_index_id`).
+                if let Some(edge_id) = exact_prop_index_id(key, encoding) {
+                    result.push(edge_id);
+                }
             }
+        }
+        if normalized_property_encoding(&encoded) == POSITIVE_ZERO_ENCODING {
+            result.sort_unstable();
         }
         Ok(result)
     }
@@ -1719,12 +1745,16 @@ impl Graph {
                     }
                 }
                 if let Some(ref min_enc) = min_encoded {
-                    if val_bytes < min_enc.as_slice() {
+                    if normalized_property_encoding(val_bytes)
+                        < normalized_property_encoding(min_enc)
+                    {
                         continue;
                     }
                 }
                 if let Some(ref max_enc) = max_encoded {
-                    if val_bytes > max_enc.as_slice() {
+                    if normalized_property_encoding(val_bytes)
+                        > normalized_property_encoding(max_enc)
+                    {
                         continue;
                     }
                 }
@@ -2255,6 +2285,100 @@ mod tests {
                 .unwrap(),
             vec![id]
         );
+    }
+
+    #[test]
+    fn signed_zero_matches_in_property_lookups_and_ranges() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({"x": -0.0})).unwrap();
+        let b = g.add_node("N", &json!({"x": 0.0})).unwrap();
+        let c = g.add_node("N", &json!({"x": 0})).unwrap();
+        g.create_edge_property_index("R", "x").unwrap();
+        let e = g.add_edge(a, b, "R", &json!({"x": -0.0})).unwrap();
+        let f = g.add_edge(a, b, "R", &json!({"x": 0.0})).unwrap();
+        for zero in [
+            PropValue::Float(-0.0),
+            PropValue::Float(0.0),
+            PropValue::Int(0),
+        ] {
+            assert_eq!(
+                g.nodes_by_property("N", "x", zero.clone()).unwrap(),
+                vec![a, b, c]
+            );
+            assert_eq!(
+                g.edges_by_property("R", "x", zero.clone()).unwrap(),
+                vec![e, f]
+            );
+            let mut nodes = g
+                .nodes_by_property_range(
+                    "N",
+                    "x",
+                    Some(zero.clone()),
+                    true,
+                    Some(zero.clone()),
+                    true,
+                )
+                .unwrap();
+            nodes.sort_unstable();
+            assert_eq!(nodes, vec![a, b, c]);
+            assert!(
+                g.nodes_by_property_range("N", "x", Some(zero.clone()), false, None, true)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                g.nodes_by_property_range("N", "x", None, true, Some(zero.clone()), false)
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut edges = g
+                .edges_by_property_range("R", "x", Some(zero.clone()), Some(zero))
+                .unwrap();
+            edges.sort_unstable();
+            assert_eq!(edges, vec![e, f]);
+        }
+        assert!(g.create_node_unique_constraint("N", "x").is_err());
+        g.drop_edge_property_index("R", "x").unwrap();
+        assert!(g.create_edge_unique_constraint("R", "x").is_err());
+        g.delete_node(a).unwrap();
+        g.delete_node(b).unwrap();
+        g.delete_node(c).unwrap();
+        assert!(
+            g.nodes_by_property("N", "x", PropValue::Int(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            g.edges_by_property("R", "x", PropValue::Int(0))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn signed_zero_conflicts_under_unique_constraints() {
+        for (stored, duplicate) in [(-0.0, 0.0), (0.0, -0.0)] {
+            let (_dir, g) = open_tmp();
+            g.create_node_unique_constraint("N", "x").unwrap();
+            g.create_edge_unique_constraint("R", "x").unwrap();
+            let a = g.add_node("N", &json!({"x": stored})).unwrap();
+            let b = g.add_node("Other", &json!({})).unwrap();
+            g.add_edge(a, b, "R", &json!({"x": stored})).unwrap();
+            assert!(g.add_node("N", &json!({"x": duplicate})).is_err());
+            assert!(g.add_edge(a, b, "R", &json!({"x": duplicate})).is_err());
+            g.delete_node(a).unwrap();
+            g.delete_node(b).unwrap();
+            assert!(
+                g.nodes_by_property("N", "x", PropValue::Float(duplicate))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                g.edges_by_property("R", "x", PropValue::Float(duplicate))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     /// `node_count_hint` is the node-id high-water mark: it tracks allocations

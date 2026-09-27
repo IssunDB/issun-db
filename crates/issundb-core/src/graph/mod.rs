@@ -268,6 +268,33 @@ pub(super) fn encode_property_value(val: &serde_json::Value) -> Option<Vec<u8>> 
     }
 }
 
+const POSITIVE_ZERO_ENCODING: [u8; 17] = [3, 128, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0];
+const NEGATIVE_ZERO_ENCODING: [u8; 17] = [
+    3, 127, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0,
+];
+
+// Preserve stored keys, including negative zero, while comparing both signs as equal.
+pub(super) fn normalized_property_encoding(encoded: &[u8]) -> &[u8] {
+    if encoded == NEGATIVE_ZERO_ENCODING {
+        &POSITIVE_ZERO_ENCODING
+    } else {
+        encoded
+    }
+}
+
+pub(super) fn property_lookup_encodings(encoded: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let alternate = if normalized_property_encoding(encoded) == POSITIVE_ZERO_ENCODING {
+        Some(if encoded == POSITIVE_ZERO_ENCODING {
+            NEGATIVE_ZERO_ENCODING.as_slice()
+        } else {
+            POSITIVE_ZERO_ENCODING.as_slice()
+        })
+    } else {
+        None
+    };
+    std::iter::once(encoded).chain(alternate)
+}
+
 /// Comparable-type family of an encoded property value's leading type tag.
 /// Booleans span two tags (`0x01` false, `0x02` true) but form one comparable
 /// family; every other tag is its own family. Range scans compare only values
@@ -606,6 +633,7 @@ pub struct WriteTxn<'a> {
     pub(super) graph: &'a Graph,
     pub(super) wtxn: crate::storage::RwTxn<'a>,
     pub(super) mutations_count: usize,
+    pub(super) failed: bool,
     /// Structural mutations staged during this transaction, flushed to the
     /// `CsrCache` only on commit so an aborted transaction records nothing.
     pub(super) delta: crate::csr::GraphDelta,
@@ -1521,6 +1549,7 @@ impl Graph {
     }
 
     /// Execute a read-write transaction inside a closure.
+    /// A failed mutation aborts the transaction even if the closure catches its error.
     pub fn update<F, T>(&self, f: F) -> Result<T, Error>
     where
         F: FnOnce(&mut WriteTxn) -> Result<T, Error>,
@@ -1532,11 +1561,17 @@ impl Graph {
             graph: self,
             wtxn,
             mutations_count: 0,
+            failed: false,
             delta: crate::csr::GraphDelta::default(),
             cache: WriteBatchCache::default(),
         };
         let _txn_guard = WriteTxnGuard::enter(self.write_txn_env_id());
         let outcome = f(&mut txn).and_then(|val| {
+            if txn.failed {
+                return Err(Error::InvalidArgument(
+                    "transaction contains a failed write".into(),
+                ));
+            }
             // The buffered adjacency and the batched counters land inside the
             // same transaction, just before the commit.
             txn.cache.flush_adjacency(&self.storage, &mut txn.wtxn)?;
@@ -1548,6 +1583,7 @@ impl Graph {
                 let WriteTxn {
                     wtxn,
                     mutations_count,
+                    failed: _,
                     delta,
                     graph: _,
                     cache: _,
