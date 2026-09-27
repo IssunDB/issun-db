@@ -58,9 +58,9 @@ walkdir = "2"
 gherkin = "=0.14"
 roaring = "=0.10"
 deepsize = { version = "0.2", features = ["derive"] }
-parquet = "60.0.0"
-arrow-array = "60.0.0"
-arrow-schema = "60.0.0"
+parquet = "=59.3.0"
+arrow-array = "=59.3.0"
+arrow-schema = "=59.3.0"
 terminal_size = "0.4"
 
 [profile.release]
