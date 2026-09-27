@@ -27,6 +27,8 @@ These invariants must hold after every successful write transaction:
    `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
    entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
    to emit incorrect `NodeIndexScan` plans.
+   Stored numeric keys preserve the sign of zero. Equality and uniqueness checks probe both zero keys, and range comparisons and constraint backfills
+   normalize them in memory. Keep the stored encoding unchanged so existing databases remain readable.
 
 ## Storage Backends
 
@@ -76,6 +78,8 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   ```
 
 - Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
+- Every fallible `WriteTxn` mutation runs through `mutate`. A failed write prevents later writes and makes `Graph::update` abort, even if the closure
+  catches the error and returns `Ok`. Read errors do not mark the transaction failed.
 - A `WriteTxn` batches its bookkeeping in `WriteBatchCache` and writes it just before the commit, in the same transaction. The next node and edge
   ids are read from `meta` once and handed out from memory, and the per-label and per-type counts accumulate as deltas; both were a `meta` read and
   write per record, a sixth of a bulk load. Every allocation and count change inside a `WriteTxn` must go through the cache (the `_inner` forms of
@@ -220,7 +224,9 @@ It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-
 - The whole-graph build streams: `ColumnSource::for_each` hands each entity's decoded properties to the per-property `ColumnBuilder`s and drops them
   before the next entity is read. Do not reintroduce a collect-everything scan (the old `scan_all`); holding every entity's `Value` until the end
   peaked at three times the finished columns' size on a million-node graph. A builder picks the tightest kind from the first non-null value and
-  degrades to `Json` at the first value of another kind, exactly as a patch does. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
+  degrades to `Json` at the first value of another kind, exactly as a patch does. A property with no non-null value finishes as an all-null `Int` column
+  with a zero presence bitmap and an integer array that can be mapped on load. This reduces heap usage and avoids decoding `n` msgpack nils on load,
+  but increases the cache payload from about one byte per slot to eight bytes per slot plus the bitmap. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
   beside the columns and invalidated by the same post-commit patch.
 - `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
   request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent

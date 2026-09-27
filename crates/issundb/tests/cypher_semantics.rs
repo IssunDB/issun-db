@@ -41,6 +41,54 @@ fn err(g: &Graph, q: &str) -> String {
     }
 }
 
+#[test]
+fn merge_rejects_computed_null_properties_on_unmatched_patterns() {
+    let (_dir, g) = open_tmp();
+    for query in [
+        "MERGE (a:Missing)-[:R]->(b:B {x: 1 + null}) RETURN b",
+        "MERGE (a:Missing)-[:R {x: 1 + null}]->(b:B) RETURN b",
+        "MERGE (a:Missing)-[:R]->(b:B)-[:S]->(c:C {x: 1 + null}) RETURN c",
+    ] {
+        assert!(err(&g, query).contains("cannot merge using null property value"));
+        assert!(g.all_nodes().unwrap().is_empty());
+        assert!(g.edges_by_type("R").unwrap().is_empty());
+    }
+    assert_eq!(
+        row(&g, "MERGE (a:A)-[:R]->(b:B {x: 2}) RETURN b.x"),
+        vec![json!(2)]
+    );
+    assert_eq!(
+        row(&g, "MERGE (a:A)-[:R]->(b:B {x: 2}) RETURN b.x"),
+        vec![json!(2)]
+    );
+    assert_eq!(g.all_nodes().unwrap().len(), 2);
+}
+
+#[test]
+fn whole_map_set_rejects_lists_containing_maps() {
+    let (_dir, g) = open_tmp();
+    g.query("CREATE (:N {x: 1})-[:R {x: 1}]->(:Other)").unwrap();
+    for target in ["n", "r"] {
+        for operator in ["=", "+="] {
+            let query = format!(
+                "MATCH (n:N)-[r:R]->() SET {target} {operator} {{x: [[{{nested: 1}}]]}} RETURN {target}"
+            );
+            assert!(err(&g, &query).contains("InvalidPropertyType"));
+            assert_eq!(
+                row(&g, "MATCH (n:N)-[r:R]->() RETURN n.x, r.x"),
+                vec![json!(1), json!(1)]
+            );
+        }
+    }
+    assert_eq!(
+        row(
+            &g,
+            "MATCH (n:N)-[r:R]->() SET n += {x: [1, 2]}, r = {x: null, y: 3} RETURN n.x, r.x, r.y"
+        ),
+        vec![json!([1, 2]), Value::Null, json!(3)]
+    );
+}
+
 fn assert_close(actual: &Value, expected: f64) {
     let a = actual
         .as_f64()

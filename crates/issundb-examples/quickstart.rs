@@ -2,13 +2,11 @@ use issundb::{Graph, GraphQueryExt};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Clean up any existing data directory from a previous run to start from a clean slate
     let db_path = Path::new("./issundb-data-quickstart");
     if db_path.exists() {
         let _ = std::fs::remove_dir_all(db_path);
     }
 
-    // Open a graph database with a 1 GB memory map size limit
     let graph = Graph::open(db_path, 1)?;
 
     let alice_props = serde_json::json!({ "name": "Alice", "age": 30 });
@@ -20,7 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let edge_props = serde_json::json!({ "since": 2021 });
     graph.add_edge(alice_id, bob_id, "KNOWS", &edge_props)?;
 
-    // Optional: rebuild CSR snapshot manually after bulk writes
     graph.rebuild_csr()?;
 
     let result =

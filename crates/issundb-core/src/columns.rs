@@ -561,9 +561,16 @@ impl ColumnBuilder {
         self.col.set(dense, value);
     }
 
-    /// The finished column over `n` slots.
+    /// The finished column over `n` slots. A property never seen with a
+    /// non-null value becomes an all-null integer column: a zero presence
+    /// bitmap and an array that can be mapped on load. This saves heap space
+    /// and decoding, but uses eight bytes per slot plus the bitmap on disk,
+    /// compared with about one byte per slot for msgpack nils.
     fn finish(mut self, n: usize) -> PropColumn {
         self.col.grow(n);
+        if matches!(&self.col, PropColumn::Json(v) if v.iter().all(Option::is_none)) {
+            return PropColumn::Int(Nullable::with_len(n));
+        }
         self.col
     }
 }

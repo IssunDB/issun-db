@@ -1407,6 +1407,9 @@ pub(super) fn apply_set_item(
                 return Ok(());
             }
             let entries = set_map_entries(txn.graph(), path, expr, params)?;
+            for (key, value) in &entries {
+                check_settable_property_value(key, value)?;
+            }
             match target {
                 SetTarget::Node(nid) => {
                     let mut props = if *merge {
@@ -1502,6 +1505,21 @@ pub(super) fn execute_create_internal_with_context(
     path: &super::PathMap,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<super::PathMap, String> {
+    create_pattern_with_context(txn, pattern, path, params, false)
+}
+
+fn create_pattern_with_context(
+    txn: &mut issundb_core::WriteTxn,
+    pattern: &Pattern,
+    path: &super::PathMap,
+    params: &HashMap<String, serde_json::Value>,
+    merging: bool,
+) -> Result<super::PathMap, String> {
+    let eval_properties = if merging {
+        eval_merge_properties
+    } else {
+        eval_properties
+    };
     let mut bindings = super::PathMap::new();
     let mut combined_path = path.clone();
 
@@ -1892,7 +1910,7 @@ pub(super) fn execute_merge_internal_with_context(
         }
         Ok(matches)
     } else {
-        let created = execute_create_internal_with_context(txn, &stmt.pattern, path, params)?;
+        let created = create_pattern_with_context(txn, &stmt.pattern, path, params, true)?;
         if !stmt.on_create_set.is_empty() {
             let mut combined = path.clone();
             for (k, v) in &created {

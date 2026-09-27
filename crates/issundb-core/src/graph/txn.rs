@@ -151,6 +151,17 @@ impl ReadTxn<'_> {
 }
 
 impl<'a> WriteTxn<'a> {
+    fn mutate<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.failed {
+            return Err(Error::InvalidArgument(
+                "transaction contains a failed write".into(),
+            ));
+        }
+        let result = f(self);
+        self.failed = result.is_err();
+        result
+    }
+
     /// The `Graph` this transaction was opened against. Reads through this
     /// handle (as opposed to through `self`) are only correct for state
     /// that predates the transaction: use `self`'s own methods for anything
@@ -362,12 +373,14 @@ impl<'a> WriteTxn<'a> {
     }
 
     pub fn add_node(&mut self, label: &str, props: &impl Serialize) -> Result<NodeId, Error> {
-        let node_id =
-            self.graph
-                .add_node_inner(&mut self.wtxn, Some(&mut self.cache), &[label], props)?;
-        self.mutations_count += 1;
-        self.delta.added_nodes.push(node_id);
-        Ok(node_id)
+        self.mutate(|txn| {
+            let node_id =
+                txn.graph
+                    .add_node_inner(&mut txn.wtxn, Some(&mut txn.cache), &[label], props)?;
+            txn.mutations_count += 1;
+            txn.delta.added_nodes.push(node_id);
+            Ok(node_id)
+        })
     }
 
     /// Insert a node with zero or more labels inside this write transaction.
@@ -376,64 +389,76 @@ impl<'a> WriteTxn<'a> {
         labels: &[&str],
         props: &impl Serialize,
     ) -> Result<NodeId, Error> {
-        let node_id =
-            self.graph
-                .add_node_inner(&mut self.wtxn, Some(&mut self.cache), labels, props)?;
-        self.mutations_count += 1;
-        self.delta.added_nodes.push(node_id);
-        Ok(node_id)
+        self.mutate(|txn| {
+            let node_id =
+                txn.graph
+                    .add_node_inner(&mut txn.wtxn, Some(&mut txn.cache), labels, props)?;
+            txn.mutations_count += 1;
+            txn.delta.added_nodes.push(node_id);
+            Ok(node_id)
+        })
     }
 
     pub fn update_node(&mut self, id: NodeId, props: &impl Serialize) -> Result<(), Error> {
-        self.graph.update_node_impl(&mut self.wtxn, id, props)?;
-        self.mutations_count += 1;
-        self.delta.updated_nodes.push(id);
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph.update_node_impl(&mut txn.wtxn, id, props)?;
+            txn.mutations_count += 1;
+            txn.delta.updated_nodes.push(id);
+            Ok(())
+        })
     }
 
     /// Add a label to an existing node inside this write transaction.
     pub fn add_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
-        self.graph
-            .add_label_inner(&mut self.wtxn, Some(&mut self.cache), id, label)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph
+                .add_label_inner(&mut txn.wtxn, Some(&mut txn.cache), id, label)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     /// Remove a label from an existing node inside this write transaction.
     pub fn remove_label(&mut self, id: NodeId, label: &str) -> Result<(), Error> {
-        self.graph
-            .remove_label_inner(&mut self.wtxn, Some(&mut self.cache), id, label)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph
+                .remove_label_inner(&mut txn.wtxn, Some(&mut txn.cache), id, label)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), Error> {
-        self.cache.invalidate_nodes();
-        // A deletion walks the adjacency stores, so the buffered entries go
-        // in first.
-        self.cache
-            .flush_adjacency(&self.graph.storage, &mut self.wtxn)?;
-        self.graph
-            .delete_node_inner(&mut self.wtxn, Some(&mut self.cache), id)?;
-        self.mutations_count += 1;
-        // A node deletion cascades to every incident edge, so the property columns
-        // and the CSR snapshot rebuild rather than patch.
-        self.delta.force_full = true;
-        Ok(())
+        self.mutate(|txn| {
+            txn.cache.invalidate_nodes();
+            // A deletion walks the adjacency stores, so the buffered entries go
+            // in first.
+            txn.cache
+                .flush_adjacency(&txn.graph.storage, &mut txn.wtxn)?;
+            txn.graph
+                .delete_node_inner(&mut txn.wtxn, Some(&mut txn.cache), id)?;
+            txn.mutations_count += 1;
+            // A node deletion cascades to every incident edge, so the property columns
+            // and the CSR snapshot rebuild rather than patch.
+            txn.delta.force_full = true;
+            Ok(())
+        })
     }
 
     pub fn delete_edge(&mut self, id: EdgeId) -> Result<(), Error> {
-        self.cache
-            .flush_adjacency(&self.graph.storage, &mut self.wtxn)?;
-        if self
-            .graph
-            .delete_edge_inner(&mut self.wtxn, Some(&mut self.cache), id)?
-            .is_some()
-        {
-            self.delta.removed_edge = true;
-        }
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.cache
+                .flush_adjacency(&txn.graph.storage, &mut txn.wtxn)?;
+            if txn
+                .graph
+                .delete_edge_inner(&mut txn.wtxn, Some(&mut txn.cache), id)?
+                .is_some()
+            {
+                txn.delta.removed_edge = true;
+            }
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     pub fn add_edge(
@@ -443,61 +468,73 @@ impl<'a> WriteTxn<'a> {
         etype: &str,
         props: &impl Serialize,
     ) -> Result<EdgeId, Error> {
-        let (edge_id, edge_type) =
-            self.graph
-                .add_edge_cached(&mut self.wtxn, &mut self.cache, src, dst, etype, props)?;
-        self.mutations_count += 1;
-        self.delta.added_edges.push(crate::csr::AddedEdge {
-            src,
-            dst,
-            edge_type,
-            edge_id,
-        });
-        Ok(edge_id)
+        self.mutate(|txn| {
+            let (edge_id, edge_type) =
+                txn.graph
+                    .add_edge_cached(&mut txn.wtxn, &mut txn.cache, src, dst, etype, props)?;
+            txn.mutations_count += 1;
+            txn.delta.added_edges.push(crate::csr::AddedEdge {
+                src,
+                dst,
+                edge_type,
+                edge_id,
+            });
+            Ok(edge_id)
+        })
     }
 
     /// Update the properties of an existing edge inside this write
     /// transaction, preserving src, dst, and type.
     pub fn update_edge(&mut self, id: EdgeId, props: &impl Serialize) -> Result<(), Error> {
-        self.graph.update_edge_impl(&mut self.wtxn, id, props)?;
-        self.mutations_count += 1;
-        self.delta.updated_edges.push(id);
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph.update_edge_impl(&mut txn.wtxn, id, props)?;
+            txn.mutations_count += 1;
+            txn.delta.updated_edges.push(id);
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
     pub fn put_vector_bytes(&mut self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
-        self.graph.put_vector_bytes_impl(&mut self.wtxn, n, bytes)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph.put_vector_bytes_impl(&mut txn.wtxn, n, bytes)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     /// Delete the raw vector bytes for `n` from LMDB. No-op if absent.
     #[doc(hidden)]
     pub fn delete_vector_bytes(&mut self, n: NodeId) -> Result<(), Error> {
-        self.graph.delete_vector_bytes_impl(&mut self.wtxn, n)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph.delete_vector_bytes_impl(&mut txn.wtxn, n)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
     pub fn create_node_text_index(&mut self, label: &str, property: &str) -> Result<(), Error> {
-        self.graph.create_node_text_index_impl(
-            &mut self.wtxn,
-            label,
-            property,
-            Language::English,
-        )?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph.create_node_text_index_impl(
+                &mut txn.wtxn,
+                label,
+                property,
+                Language::English,
+            )?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
     pub fn drop_node_text_index(&mut self, label: &str, property: &str) -> Result<(), Error> {
-        self.graph
-            .drop_node_text_index_impl(&mut self.wtxn, label, property)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph
+                .drop_node_text_index_impl(&mut txn.wtxn, label, property)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
@@ -541,10 +578,12 @@ impl<'a> WriteTxn<'a> {
         property: &str,
         lang: Language,
     ) -> Result<(), Error> {
-        self.graph
-            .create_node_text_index_impl(&mut self.wtxn, label, property, lang)?;
-        self.mutations_count += 1;
-        Ok(())
+        self.mutate(|txn| {
+            txn.graph
+                .create_node_text_index_impl(&mut txn.wtxn, label, property, lang)?;
+            txn.mutations_count += 1;
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
@@ -565,6 +604,71 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let g = Graph::open(dir.path(), 1).unwrap();
         (dir, g)
+    }
+
+    #[test]
+    fn caught_mutation_errors_abort_the_entire_transaction() {
+        for operation in [
+            "add_node",
+            "add_node_multi",
+            "update_node",
+            "add_label",
+            "add_edge",
+            "update_edge",
+        ] {
+            let (_dir, g) = open_tmp();
+            let a = g.add_node("N", &json!({"x": 1})).unwrap();
+            let b = g.add_node("N", &json!({"x": 2})).unwrap();
+            let c = g.add_node("Other", &json!({"x": 1})).unwrap();
+            let e = g.add_edge(a, b, "R", &json!({"x": 1})).unwrap();
+            let f = g.add_edge(a, b, "R", &json!({"x": 2})).unwrap();
+            g.create_node_unique_constraint("N", "x").unwrap();
+            g.create_edge_unique_constraint("R", "x").unwrap();
+            g.materialize_property_columns().unwrap();
+            let generation = g.plan_generation();
+
+            let result = g.update(|txn| {
+                txn.add_node("Pending", &json!({}))?;
+                let failed = match operation {
+                    "add_node" => txn.add_node("N", &json!({"x": 1})).map(|_| ()),
+                    "add_node_multi" => txn
+                        .add_node_multi(&["Other", "N"], &json!({"x": 1}))
+                        .map(|_| ()),
+                    "update_node" => txn.update_node(b, &json!({"x": 1})),
+                    "add_label" => txn.add_label(c, "N"),
+                    "add_edge" => txn.add_edge(a, b, "R", &json!({"x": 1})).map(|_| ()),
+                    "update_edge" => txn.update_edge(f, &json!({"x": 1})),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    matches!(failed, Err(Error::UniqueConstraintViolation(..))),
+                    "{operation}"
+                );
+                assert!(txn.add_node("AfterFailure", &json!({})).is_err());
+                Ok(())
+            });
+
+            assert!(result.is_err(), "{operation}");
+            assert_eq!(g.plan_generation(), generation);
+            assert_eq!(g.all_nodes().unwrap(), vec![a, b, c]);
+            assert_eq!(g.nodes_by_label("N").unwrap(), vec![a, b]);
+            assert_eq!(g.node_count_by_label("N").unwrap(), 2);
+            assert_eq!(g.node_prop_json(b, "x").unwrap(), Some(json!(2)));
+            assert_eq!(
+                g.nodes_by_property("N", "x", PropValue::Int(2)).unwrap(),
+                vec![b]
+            );
+            assert_eq!(g.edges_by_type("R").unwrap(), vec![e, f]);
+            assert_eq!(
+                g.edges_by_property("R", "x", PropValue::Int(2)).unwrap(),
+                vec![f]
+            );
+            g.delete_node(a).unwrap();
+            g.delete_node(b).unwrap();
+            g.delete_node(c).unwrap();
+            assert!(g.all_nodes().unwrap().is_empty());
+            assert!(g.edges_by_type("R").unwrap().is_empty());
+        }
     }
 
     #[test]

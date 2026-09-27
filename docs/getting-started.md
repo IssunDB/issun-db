@@ -122,7 +122,7 @@ To use IssunDB as an embedded database in a Rust project, add the `issundb` libr
 
 ```toml
 [dependencies]
-issundb = "0.1.0-alpha.29"   # Update to match the latest version on Crates.io
+issundb = "0.1.0-alpha.30"   # Update to match the latest version on Crates.io
 serde_json = "1.0"           # This is used to construct property maps
 ```
 

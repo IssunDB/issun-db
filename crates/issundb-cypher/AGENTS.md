@@ -179,7 +179,10 @@ The `VecRoot` variants escalate in generality:
 - `AggregateGeneral`: group keys or aggregate inputs are general scalar expressions (CASE, arithmetic, comparisons, IS NULL, function calls) over
   chain node and relationship variables, including edge properties. It binds each row's node and edge ids and folds through the shared `evaluate_expr`
   and `AggState`, so its semantics match the row pipeline exactly. `agg_expr_eligible` gates which expressions qualify; anything it declines stays on
-  the row pipeline, so correctness never depends on the gate.
+  the row pipeline, so correctness never depends on the gate. Only the group keys and the aggregates over expressions bind the row's variables; an
+  aggregate over a bare property (`SUM(be.pa)`) folds its gathered cell directly, the last such reader taking the cell and earlier ones cloning it.
+  A group's row is built once, when its key is first seen. These changes avoid per-row property maps for bare aggregates and repeated group-row
+  construction. Their effect on query latency requires workload-specific benchmarks.
 
 Both aggregate roots read properties from the in-memory columnar store (see "In-memory Property Columns" in `issundb-core/AGENTS.md`): one bulk gather
 of every referenced `(variable, property)` column per query rather than a point read per row. Every vectorized shape must be covered by a differential
@@ -227,14 +230,14 @@ CREATE, SET, DELETE, and MERGE all mutate the graph:
 
 - A single statement's write clauses, and the `RETURN`/`WITH` projection that follows them, share one `Graph::update` transaction, so an error anywhere
   rolls back every write the statement already made. Do not open a second transaction inside a statement.
+- MERGE validates computed properties on the creation path too, so an unmatched prefix cannot hide a null property on a later element.
+- Whole-map SET replacement and merge validate each property's value through the same check as a single-property assignment, for both nodes and edges.
 - Mutate through the `WriteTxn` methods on the open transaction (`txn.add_node`, `txn.add_edge`, `txn.update_node`, `txn.delete_node`,
   `txn.delete_edge`), not through the auto-committing `Graph` methods of the same name: those open their own transaction and would deadlock against the
   one `Graph::update` already holds. A debug assertion catches that mistake at the call site. Never call `Storage` from the `exec` module.
 - Do not rebuild the CSR snapshot by hand. `Graph::update` publishes the write to the caches' freshness counters at commit, and each consumer's gate
   rebuilds what it needs on demand (see the freshness gates in the root `AGENTS.md`).
-- A `MATCH` or scan *after* a write clause in the same statement does not see that write's structural effect, because it reads the committed-only label
-  index and CSR snapshot rather than the open transaction. A `RETURN`/`WITH` reading a property of a variable the statement just wrote does see it,
-  through the pending-writes overlay in `exec/expr.rs`.
+- A `MATCH` or scan after a write clause in the same statement sees that write's structural effect through the open transaction, matching openCypher clause ordering.
 
 ## Statement Clock
 

@@ -194,7 +194,6 @@ impl LogicalPlanner {
             }
             p
         } else {
-            // New multi-part sequence planning flow
             use crate::ast::QueryPart;
             let mut current_plan: Option<LogicalOperator> = None;
 
@@ -680,7 +679,6 @@ impl LogicalPlanner {
             };
         }
 
-        // INSERT ORDER BY above Project.
         if let Some(ref items) = order_by_items {
             plan = LogicalOperator::Sort {
                 input: Box::new(plan),
@@ -688,8 +686,6 @@ impl LogicalPlanner {
             };
         }
 
-        // INSERT SKIP / LIMIT above Sort (or Project if no ORDER BY).
-        // Validate SKIP/LIMIT expressions before using them.
         if let Some(skip_expr) = &query.skip {
             validate_skip_limit(skip_expr, "SKIP")?;
         }
@@ -1292,7 +1288,6 @@ fn rewrite_grouping_refs(expr: &mut Expr, projections: &[(Expr, String)]) {
 }
 
 fn rewrite_aliases(expr: &mut Expr, projections: &[(Expr, String)], into_aggs: bool) {
-    // Check if the current expression matches any projected source expression exactly.
     for (source_expr, target_var) in projections {
         if expr == source_expr {
             *expr = Expr::Prop(target_var.clone(), "".to_string());
@@ -1300,7 +1295,6 @@ fn rewrite_aliases(expr: &mut Expr, projections: &[(Expr, String)], into_aggs: b
         }
     }
 
-    // Otherwise, recursively rewrite child expressions.
     match expr {
         Expr::Prop(_, _) | Expr::Literal(_) | Expr::Param(_) | Expr::CountStar => {}
         Expr::Agg(_, inner) => {

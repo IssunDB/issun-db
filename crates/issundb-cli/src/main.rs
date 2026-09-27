@@ -2493,7 +2493,7 @@ fn print_stats(s: &GraphStats) {
         print_named_counts(&s.rel_types);
     }
 
-    println!("{}", "Indexes & Constraints".cyan().bold());
+    println!("{}", "Indexes and Constraints".cyan().bold());
     if s.node_indexes.is_empty() && s.edge_indexes.is_empty() {
         println!("  (none)");
     } else {
@@ -4025,7 +4025,7 @@ mod tests {
         ));
         assert!(restored.exists());
 
-        // 4h. Close releases the open database without exiting; a second close
+        // Close releases the open database without exiting; a second close
         // is a no-op against the now-empty state.
         assert!(state.graph.is_some());
         assert!(handle(&mut state, ":close"));

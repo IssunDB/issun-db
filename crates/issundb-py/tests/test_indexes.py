@@ -1,7 +1,7 @@
 """Tests for index administration and filtered search across the binding boundary.
 
 Covers vector index configuration and reindexing, vector search filters, the
-full-text index language argument and listing, and GraphBLAS thread control.
+full-text index language argument and listing, and parallel thread control.
 """
 
 import json
@@ -103,7 +103,6 @@ def test_set_thread_count_is_accepted(db):
 def test_label_management(db):
     nid = db.add_node("Person", json.dumps({"name": "Ada"}))
     db.add_label(nid, "Admin")
-    # Verify via Cypher
     res = json.loads(db.query("MATCH (n:Admin) RETURN n.name AS name"))
     assert ["Ada"] in [r["values"] for r in res["records"]]
 

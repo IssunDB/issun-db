@@ -48,7 +48,7 @@ fn build_oltp_graph() -> (TempDir, Graph) {
             txn.add_edge(persons[i], cities[i % NUM_CITIES], "LIVES_IN", &json!({}))?;
         }
 
-        // 5. Connect Persons with KNOWS (coprime offsets)
+        // Connect Persons with KNOWS (coprime offsets)
         let knows_offsets = [1, 7, 13];
         for i in 0..NUM_PERSONS {
             for off in knows_offsets {
@@ -61,7 +61,7 @@ fn build_oltp_graph() -> (TempDir, Graph) {
             }
         }
 
-        // 6. Give each of the first 50 people 20 posts so IS2 performs a real
+        // Give each of the first 50 people 20 posts so IS2 performs a real
         // top-10 selection instead of sorting a single row.
         for i in 0..NUM_POSTS {
             txn.add_edge(posts[i], persons[i % 50], "HAS_CREATOR", &json!({}))?;

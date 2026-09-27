@@ -381,7 +381,9 @@ mod tests {
             );
             Ok(())
         });
-        assert!(outcome.is_ok(), "the batch itself should succeed");
+        assert!(outcome.is_err(), "the rejected write aborts the batch");
+        assert!(g.all_nodes().unwrap().is_empty());
+        assert!(g.edges_by_type("R").unwrap().is_empty());
     }
 
     /// Every edge of a batch must reach the type's property index, not only the
