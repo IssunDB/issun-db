@@ -93,4 +93,3 @@ The temporal constructors `date`, `time`, `localtime`, `datetime`, `localdatetim
   `"chris"`, not any string that merely contains it.
 - Temporal years are limited to roughly the range -262143 to 262143, narrower than the openCypher specification admits.
 - The openCypher TCK subset run (`make test-conformance`) tracks the remaining known gaps; failures there are documented deviations rather than silent wrong results.
-
