@@ -149,7 +149,7 @@ clean: ## Remove generated and temporary files
 install-snap: ## Install a few dependencies using Snapcraft
 	@echo "Installing the snap package..."
 	@sudo apt-get update
-	@sudo apt-get install -y snapd graphviz wget
+	@sudo apt-get install -y snapd graphviz wget mold
 	@sudo snap refresh
 	@sudo snap install rustup --classic
 
