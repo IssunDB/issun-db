@@ -42,15 +42,17 @@ Do not add any path that changes `dims` after initialization.
 The metric and quantization are fixed at index construction time. `configure_vector_index` therefore returns `VectorError::AlreadyConfigured` when it
 would change either one on a graph that already holds embeddings. `reindex_vector_index` is the sanctioned way to change them afterward: the stored
 vectors are raw, metric-agnostic f32, so it rebuilds the whole in-memory index from LMDB under the new configuration. That rebuild is O(n) and is an
-administrative operation; the vector mutation lock serializes it against concurrent upserts and removes, which block for its duration.
+administrative operation; the graph write lock serializes it against concurrent upserts and removes, which block for its duration.
 
-## The Vector Mutation Lock
+## Vector Cache Freshness
 
-Every mutation on the `VectorGraphExt` surface performs two steps: an in-memory index update and a storage write. `VectorMutationLock`, a graph
-extension holding one mutex, spans both steps in `upsert_vector`, `remove_vector`, `configure_vector_index`, and `reindex_vector_index`, so concurrent
-calls for one node cannot leave the index ranking by one embedding while storage holds another. The ordering rule: acquire the mutation lock first,
-before the index's internal `RwLock` and before any storage transaction, and never while holding the `extensions` mutex. Read paths take the index
-`RwLock` without the mutation lock, which stays safe as long as no path acquires the two in the reverse order.
+Vector mutations hold `Graph::with_vector_write_lock` across the index update and storage write. Acquire this graph write lock before the index's
+internal `RwLock`, and never while holding the `extensions` mutex. Configuration changes and rebuilds use the same lock.
+
+Core advances `Graph::vector_generation` after raw vector writes commit, including writes staged through `WriteTxn`. The cached vector index carries
+that generation. A stale cache rebuilds from committed bytes under the graph write lock; a current search reads without that lock. Normal upserts and
+removes update the cached generation after their storage write, so they keep the existing index rather than rebuilding it. Invalidate the cached
+generation before mutating the index, so a failed storage write cannot leave the modified index serving later searches.
 
 ## The Backend Seam
 
@@ -95,12 +97,9 @@ These constraints are the reason `HnswBackend::upsert` looks the way it does. Th
 
 ## The Cold-start Pattern in `get_or_init_cache`
 
-`get_or_init_cache` builds the in-memory index from storage on first use, and it is one call:
-`graph.get_or_init_extension_with(..)`, whose initializer loads the persisted configuration and then every embedding. Do not hand-roll the locking
-around it. The helper owns the double-checked insert, and the initializer deliberately runs *without* the `extensions` lock held, which is what makes
-reading from storage there safe.
-
-That ordering is the rule to preserve: never call `graph.vector_bytes()`, or any other `Graph` method, while holding the `extensions` mutex.
+`get_or_init_cache` first checks the cached generation without taking the graph write lock. On a miss or mismatch, it takes that lock, checks again,
+loads the persisted configuration and embeddings, and installs the finished index. Never build while holding the `extensions` mutex: the build
+calls back into `Graph` to read storage. The write lock prevents a concurrent vector commit from being missed by the newly installed index.
 
 ## `VectorSearchOptions` Filters
 

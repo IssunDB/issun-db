@@ -575,6 +575,7 @@ pub struct Graph {
     /// handle's identity and the count of schema changes. See
     /// [`Graph::plan_generation`].
     pub(super) plan_epoch: Arc<PlanEpoch>,
+    pub(super) vector_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -630,6 +631,7 @@ pub struct ReadTxn<'a> {
 
 /// A read-write transaction on the graph.
 pub struct WriteTxn<'a> {
+    vectors_changed: bool,
     pub(super) graph: &'a Graph,
     pub(super) wtxn: crate::storage::RwTxn<'a>,
     pub(super) mutations_count: usize,
@@ -993,6 +995,7 @@ impl Graph {
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             plan_epoch: Arc::new(PlanEpoch::new()),
+            vector_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             #[cfg(test)]
             test_hooks: Arc::new(TestHooks::default()),
@@ -1558,6 +1561,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let wtxn = self.storage.env.write_txn()?;
         let mut txn = WriteTxn {
+            vectors_changed: false,
             graph: self,
             wtxn,
             mutations_count: 0,
@@ -1581,6 +1585,7 @@ impl Graph {
         match outcome {
             Ok(val) => {
                 let WriteTxn {
+                    vectors_changed,
                     wtxn,
                     mutations_count,
                     failed: _,
@@ -1603,6 +1608,9 @@ impl Graph {
                     }
                 };
                 self.commit_and_publish(wtxn, mutations_count, change)?;
+                if vectors_changed {
+                    self.advance_vector_generation();
+                }
                 #[cfg(test)]
                 TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
                 // Column bookkeeping next. The CSR snapshot got its record inside

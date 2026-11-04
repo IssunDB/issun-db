@@ -93,6 +93,10 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
   stored entries in store order, and a deletion flushes the buffer before it walks the stores.
 
+Raw vector writes advance `Graph::vector_generation` only after commit.
+`WriteTxn` records a vector-change flag and publishes it after its commit; an abort leaves the generation alone. The vector crate
+uses `with_vector_write_lock` to coordinate cache rebuilds and index mutations with these writes, without exposing storage internals.
+
 ## Thread Count
 
 Every parallel consumer resolves its budget through `threads::resolve` (`threads.rs`). Precedence, first positive value winning: the programmatic

@@ -48,6 +48,9 @@ hand-written descent chain.
 Query text longer than `PARSE_CACHE_MAX_QUERY_LEN` is parsed but not cached, so many large unique statements cannot grow the parse cache by their
 length.
 
+Backtick identifiers escape an embedded backtick by doubling it. Exported schema statements quote every identifier this way, and import parses each
+schema file as a complete Cypher pipeline, so semicolons and newlines inside an identifier remain part of that identifier.
+
 ### Parse Diagnostics
 
 Both phases report through `render_rich`, which turns chumsky's `Rich` errors into a compiler-style diagnostic: a summary naming what was found, the
@@ -266,3 +269,15 @@ fn scenario_name() {
 
 Run them with `make test-conformance`. Do not add new conformance scenarios as inline unit tests inside `issundb-cypher`; always place them in the
 conformance directory so they stay out of the default `make test` run.
+
+## Export and Import Formats
+
+`exec/copy.rs` rejects properties named `_id`, `_labels`, `_label`, `_from`, `_to`, `_type`, or `_etype` before writing export files. Flat rows reserve
+those names for metadata, so accepting one would overwrite graph structure or discard a property on import.
+
+CSV reads complete quoted records, including embedded newlines, and rejects malformed quotes. New CSV exports encode each property as JSON text
+inside a quoted field, with `json_properties: true` in `copy.cypher`; metadata fields retain their existing encoding. Keep the old inference path for
+CSV files without that option, because existing exports and user files depend on it.
+
+`text_indexes.json` preserves each text index's label, property, and language. Import uses it when present and otherwise replays `index.cypher` for
+older exports. Export still writes `index.cypher` as a readable schema file, but that file alone does not preserve non-English languages.

@@ -89,6 +89,7 @@ pub(super) fn execute_copy_internal(
     let mut has_header = true;
     let mut delimiter = ',';
     let mut format = None;
+    let mut json_properties = false;
 
     if let Some(ref opts) = stmt.options {
         if let Some(expr) = opts.get("header") {
@@ -108,6 +109,11 @@ pub(super) fn execute_copy_internal(
                 format = Some(s.to_lowercase());
             }
         }
+        if let Some(expr) = opts.get("json_properties") {
+            json_properties = eval_opt(expr)
+                .and_then(|v| v.as_bool())
+                .ok_or("json_properties must be a boolean")?;
+        }
     }
 
     let inferred_format = format.unwrap_or_else(|| {
@@ -120,7 +126,13 @@ pub(super) fn execute_copy_internal(
     });
 
     let mut count = 0usize;
-    let mut source = RowSource::open(&stmt.filepath, &inferred_format, has_header, delimiter)?;
+    let mut source = RowSource::open(
+        &stmt.filepath,
+        &inferred_format,
+        has_header,
+        delimiter,
+        json_properties,
+    )?;
 
     // The first row is pulled ahead of the transaction because classification
     // reads it; every later row streams straight into the transaction, so an
@@ -308,9 +320,10 @@ enum RowSource {
         lines: std::iter::Enumerate<std::io::Lines<BufReader<File>>>,
     },
     Csv {
-        lines: std::iter::Enumerate<std::io::Lines<BufReader<File>>>,
+        reader: BufReader<File>,
         headers: Vec<String>,
         delimiter: char,
+        json_properties: bool,
     },
     Parquet {
         reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
@@ -324,6 +337,7 @@ impl RowSource {
         format: &str,
         has_header: bool,
         delimiter: char,
+        json_properties: bool,
     ) -> Result<Self, String> {
         if format == "parquet" {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -340,23 +354,28 @@ impl RowSource {
         }
         let file = File::open(filepath)
             .map_err(|e| format!("failed to open file '{}': {}", filepath, e))?;
-        let mut lines = BufReader::new(file).lines().enumerate();
+        let mut reader = BufReader::new(file);
         if format == "jsonl" {
-            return Ok(Self::Jsonl { lines });
+            return Ok(Self::Jsonl {
+                lines: reader.lines().enumerate(),
+            });
         }
         let mut headers = Vec::new();
         if has_header {
-            if let Some((_, line_res)) = lines.next() {
-                let line = line_res.map_err(|e| format!("failed to read CSV header: {}", e))?;
-                headers = parse_csv_line(&line, delimiter);
+            if let Some(line) = read_csv_record(&mut reader)? {
+                headers = parse_csv_line_quoted(&line, delimiter)?
+                    .into_iter()
+                    .map(|(cell, _)| cell)
+                    .collect();
             } else {
                 return Err("CSV file is empty".to_string());
             }
         }
         Ok(Self::Csv {
-            lines,
+            reader,
             headers,
             delimiter,
+            json_properties,
         })
     }
 
@@ -394,36 +413,52 @@ impl RowSource {
                 None
             }
             Self::Csv {
-                lines,
+                reader,
                 headers,
                 delimiter,
-            } => {
-                for (i, line_res) in lines.by_ref() {
-                    let line = match line_res {
-                        Ok(line) => line,
-                        Err(e) => {
-                            return Some(Err(format!("error reading CSV line {}: {}", i + 1, e)));
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let cols = parse_csv_line_quoted(&line, *delimiter);
-                    if headers.is_empty() {
-                        *headers = (0..cols.len()).map(|idx| format!("col{}", idx)).collect();
-                    }
-                    let mut props = serde_json::Map::new();
-                    for (j, header) in headers.iter().enumerate() {
-                        let (val_str, quoted) = cols
-                            .get(j)
-                            .map(|(s, q)| (s.as_str(), *q))
-                            .unwrap_or(("", false));
-                        props.insert(header.clone(), csv_cell_value(val_str, quoted));
-                    }
-                    return Some(Ok(props));
+                json_properties,
+            } => loop {
+                let line = match read_csv_record(reader) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
-                None
-            }
+                let cols = match parse_csv_line_quoted(&line, *delimiter) {
+                    Ok(cols) => cols,
+                    Err(e) => return Some(Err(e)),
+                };
+                if headers.is_empty() {
+                    *headers = (0..cols.len()).map(|idx| format!("col{}", idx)).collect();
+                }
+                let mut props = serde_json::Map::new();
+                for (j, header) in headers.iter().enumerate() {
+                    let (val_str, quoted) = cols
+                        .get(j)
+                        .map(|(s, q)| (s.as_str(), *q))
+                        .unwrap_or(("", false));
+                    let value = if *json_properties
+                        && matches!(header.as_str(), "_type" | "_etype" | "_label")
+                    {
+                        Value::String(val_str.to_owned())
+                    } else if *json_properties && !is_copy_metadata(header) {
+                        match serde_json::from_str(val_str) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                return Some(Err(format!(
+                                    "invalid JSON in CSV property '{header}': {e}"
+                                )));
+                            }
+                        }
+                    } else {
+                        csv_cell_value(val_str, quoted)
+                    };
+                    props.insert(header.clone(), value);
+                }
+                return Some(Ok(props));
+            },
             Self::Parquet { reader, pending } => loop {
                 if let Some(obj) = pending.pop_front() {
                     return Some(Ok(obj));
@@ -489,11 +524,39 @@ pub(super) fn execute_export_db(
         }
     }
 
+    let all_nodes = graph.all_nodes().map_err(|e| e.to_string())?;
+    // Flat export rows reserve metadata keys; reject collisions before truncating any file.
+    graph
+        .view(|txn| {
+            let check = |bytes: &[u8]| -> Result<(), issundb_core::Error> {
+                let props: Value =
+                    rmp_serde::from_slice(bytes).map_err(|e| custom_err(&e.to_string()))?;
+                if let Some(obj) = props.as_object() {
+                    if let Some(key) = obj.keys().find(|key| is_copy_metadata(key)) {
+                        return Err(custom_err(&format!(
+                            "cannot export reserved property '{key}'"
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            for &id in &all_nodes {
+                if let Some(node) = txn.get_node(id)? {
+                    check(&node.props)?;
+                }
+                for neighbor in txn.out_neighbors(id)? {
+                    if let Some(edge) = txn.get_edge(neighbor.edge)? {
+                        check(&edge.props)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+
     let dir = Path::new(&stmt.filepath);
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("failed to create export directory: {}", e))?;
-
-    let all_nodes = graph.all_nodes().map_err(|e| e.to_string())?;
 
     let nodes_file_name = if format == "csv" {
         "nodes.csv"
@@ -567,7 +630,16 @@ pub(super) fn execute_export_db(
 
         let mut header_cols = vec!["_id".to_string(), "_labels".to_string()];
         header_cols.extend(node_keys.iter().cloned());
-        writeln!(nodes_file, "{}", header_cols.join(",")).map_err(|e| e.to_string())?;
+        writeln!(
+            nodes_file,
+            "{}",
+            header_cols
+                .iter()
+                .map(|s| escape_csv_string(s))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .map_err(|e| e.to_string())?;
 
         for &nid in &all_nodes {
             let record = graph
@@ -581,7 +653,7 @@ pub(super) fn execute_export_db(
                     labels.push(lname);
                 }
             }
-            let labels_str = labels.join(":");
+            let labels_str = serde_json::to_string(&labels).map_err(|e| e.to_string())?;
 
             let props: Value = rmp_serde::from_slice(&record.props).map_err(|e| e.to_string())?;
             let props_obj = props.as_object();
@@ -704,7 +776,16 @@ pub(super) fn execute_export_db(
 
         let mut header_cols = vec!["_from".to_string(), "_to".to_string(), "_type".to_string()];
         header_cols.extend(edge_keys.iter().cloned());
-        writeln!(edges_file, "{}", header_cols.join(",")).map_err(|e| e.to_string())?;
+        writeln!(
+            edges_file,
+            "{}",
+            header_cols
+                .iter()
+                .map(|s| escape_csv_string(s))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .map_err(|e| e.to_string())?;
 
         for &nid in &all_nodes {
             let neighbors = graph.out_neighbors(nid).map_err(|e| e.to_string())?;
@@ -778,6 +859,8 @@ pub(super) fn execute_export_db(
         .list_node_indexes_and_constraints()
         .map_err(|e| e.to_string())?;
     for (label, prop, flags) in node_idx {
+        let label = quote_identifier(&label);
+        let prop = quote_identifier(&prop);
         match flags {
             // A node `CREATE INDEX` in Cypher provisions the full-text index, so
             // a declared node property index has no statement that recreates it;
@@ -804,6 +887,8 @@ pub(super) fn execute_export_db(
         .list_edge_indexes_and_constraints()
         .map_err(|e| e.to_string())?;
     for (etype, prop, flags) in edge_idx {
+        let etype = quote_identifier(&etype);
+        let prop = quote_identifier(&prop);
         match flags {
             0x00 => writeln!(
                 schema_file,
@@ -833,11 +918,17 @@ pub(super) fn execute_export_db(
 
     use issundb_text::TextIndexExt;
     let text_idx = graph.list_text_indexes().map_err(|e| e.to_string())?;
+    serde_json::to_writer(
+        File::create(dir.join("text_indexes.json")).map_err(|e| e.to_string())?,
+        &text_idx,
+    )
+    .map_err(|e| e.to_string())?;
     for (label, prop, _lang) in text_idx {
         writeln!(
             index_file,
             "CREATE INDEX FOR (n:{}) ON (n.{});",
-            label, prop
+            quote_identifier(&label),
+            quote_identifier(&prop)
         )
         .map_err(|e| e.to_string())?;
     }
@@ -849,12 +940,12 @@ pub(super) fn execute_export_db(
     if format == "csv" {
         writeln!(
             copy_file,
-            "COPY nodes FROM 'nodes.csv' WITH {{format: 'csv', header: true, delimiter: ','}};"
+            "COPY nodes FROM 'nodes.csv' WITH {{format: 'csv', header: true, delimiter: ',', json_properties: true}};"
         )
         .map_err(|e| e.to_string())?;
         writeln!(
             copy_file,
-            "COPY edges FROM 'edges.csv' WITH {{format: 'csv', header: true, delimiter: ','}};"
+            "COPY edges FROM 'edges.csv' WITH {{format: 'csv', header: true, delimiter: ',', json_properties: true}};"
         )
         .map_err(|e| e.to_string())?;
     } else if format == "parquet" {
@@ -907,12 +998,8 @@ pub(super) fn execute_import_db(
     if schema_path.is_file() {
         let content = std::fs::read_to_string(&schema_path)
             .map_err(|e| format!("failed to read schema.cypher: {}", e))?;
-        for raw_stmt in content.split(';') {
-            let trimmed = raw_stmt.trim();
-            if !trimmed.is_empty() {
-                super::execute(graph, trimmed, params)
-                    .map_err(|e| format!("schema error on '{}': {}", trimmed, e))?;
-            }
+        if !content.trim().is_empty() {
+            super::execute(graph, &content, params).map_err(|e| format!("schema error: {e}"))?;
         }
     }
 
@@ -966,15 +1053,21 @@ pub(super) fn execute_import_db(
     }
 
     let index_path = dir.join("index.cypher");
-    if index_path.is_file() {
+    let text_indexes_path = dir.join("text_indexes.json");
+    if text_indexes_path.is_file() {
+        let indexes: Vec<(String, String, issundb_core::Language)> =
+            serde_json::from_reader(File::open(&text_indexes_path).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("invalid text_indexes.json: {e}"))?;
+        for (label, property, language) in indexes {
+            graph
+                .create_node_text_index_with_language(&label, &property, language)
+                .map_err(|e| e.to_string())?;
+        }
+    } else if index_path.is_file() {
         let content = std::fs::read_to_string(&index_path)
             .map_err(|e| format!("failed to read index.cypher: {}", e))?;
-        for raw_stmt in content.split(';') {
-            let trimmed = raw_stmt.trim();
-            if !trimmed.is_empty() {
-                super::execute(graph, trimmed, params)
-                    .map_err(|e| format!("index error on '{}': {}", trimmed, e))?;
-            }
+        if !content.trim().is_empty() {
+            super::execute(graph, &content, params).map_err(|e| format!("index error: {e}"))?;
         }
     }
 
@@ -1001,22 +1094,57 @@ pub(super) fn execute_import_db(
     })
 }
 
-fn parse_csv_line(s: &str, delimiter: char) -> Vec<String> {
-    parse_csv_line_quoted(s, delimiter)
-        .into_iter()
-        .map(|(v, _)| v)
-        .collect()
+fn is_copy_metadata(key: &str) -> bool {
+    matches!(
+        key,
+        "_id" | "_labels" | "_label" | "_from" | "_to" | "_type" | "_etype"
+    )
 }
 
-/// Split one CSV line into `(cell, was_quoted)` pairs. Quotedness carries the
-/// type distinction on import: a quoted cell was a string on export (its text
-/// imports verbatim, whitespace included), while an unquoted cell is a
-/// non-string scalar subject to inference.
-fn parse_csv_line_quoted(s: &str, delimiter: char) -> Vec<(String, bool)> {
+fn quote_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn read_csv_record(reader: &mut impl BufRead) -> Result<Option<String>, String> {
+    let mut record = String::new();
+    let mut in_quotes = false;
+    loop {
+        let start = record.len();
+        if reader
+            .read_line(&mut record)
+            .map_err(|e| format!("error reading CSV: {e}"))?
+            == 0
+        {
+            return if in_quotes {
+                Err("unterminated quoted CSV field".to_string())
+            } else {
+                Ok(None)
+            };
+        }
+        for byte in record[start..].bytes() {
+            if byte == b'"' {
+                in_quotes = !in_quotes;
+            }
+        }
+        if !in_quotes {
+            if record.ends_with('\n') {
+                record.pop();
+                if record.ends_with('\r') {
+                    record.pop();
+                }
+            }
+            return Ok(Some(record));
+        }
+    }
+}
+
+/// Split a CSV record into cells, preserving quoted whitespace for legacy type inference.
+fn parse_csv_line_quoted(s: &str, delimiter: char) -> Result<Vec<(String, bool)>, String> {
     let mut cols = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
     let mut was_quoted = false;
+    let mut closed = false;
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -1024,9 +1152,15 @@ fn parse_csv_line_quoted(s: &str, delimiter: char) -> Vec<(String, bool)> {
             if in_quotes && chars.peek() == Some(&'"') {
                 chars.next();
                 current.push('"');
-            } else {
-                in_quotes = !in_quotes;
+            } else if in_quotes {
+                in_quotes = false;
+                closed = true;
+            } else if !was_quoted && current.trim().is_empty() {
+                current.clear();
+                in_quotes = true;
                 was_quoted = true;
+            } else {
+                return Err("unexpected quote in CSV field".to_string());
             }
         } else if c == delimiter && !in_quotes {
             let cell = if was_quoted {
@@ -1036,9 +1170,17 @@ fn parse_csv_line_quoted(s: &str, delimiter: char) -> Vec<(String, bool)> {
             };
             cols.push((cell, was_quoted));
             was_quoted = false;
+            closed = false;
+        } else if closed {
+            if !c.is_whitespace() {
+                return Err("unexpected text after quoted CSV field".to_string());
+            }
         } else {
             current.push(c);
         }
+    }
+    if in_quotes {
+        return Err("unterminated quoted CSV field".to_string());
     }
     let cell = if was_quoted {
         current
@@ -1046,20 +1188,11 @@ fn parse_csv_line_quoted(s: &str, delimiter: char) -> Vec<(String, bool)> {
         current.trim().to_owned()
     };
     cols.push((cell, was_quoted));
-    cols
+    Ok(cols)
 }
 
 fn format_csv_cell(val: &Value) -> String {
-    match val {
-        Value::Null => "".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        // Strings are always quoted so import can tell the string "true"
-        // apart from the boolean true (and "" apart from null). Lists and
-        // maps are quoted JSON text.
-        Value::String(s) => escape_csv_string(s),
-        Value::Array(_) | Value::Object(_) => escape_csv_string(&val.to_string()),
-    }
+    escape_csv_string(&val.to_string())
 }
 
 fn escape_csv_string(s: &str) -> String {
