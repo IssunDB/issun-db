@@ -30,52 +30,64 @@
     {
       devShells = forAllSystems (pkgs:
         let
-          # Retrieve the exact rust toolchain specified in rust-toolchain.toml
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-
-          # Darwin-specific frameworks for macOS development
-          darwinDeps = with pkgs; lib.optionals stdenv.isDarwin [
-            darwin.apple_sdk.frameworks.Foundation
-            darwin.apple_sdk.frameworks.Security
-          ];
-        in
-        {
-          default = pkgs.mkShell {
+          msrv = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rustfmt" "clippy" "rust-analyzer" "llvm-tools-preview" ];
+            targets = [ "wasm32-unknown-unknown" ];
+          };
+          benchmarkToolchain = pkgs.rust-bin.fromRustupToolchainFile
+            ./benchmarks/ladybugdb-compare/rust-toolchain.toml;
+          wasmBindgenSrc = pkgs.fetchCrate {
+            pname = "wasm-bindgen-cli";
+            version = "0.2.122";
+            hash = "sha256-vO4RSxi/sMWxmsEs3GuljdMfIRSu75A+Q+c5wgYToRU=";
+          };
+          wasmBindgen = pkgs.buildWasmBindgenCli {
+            src = wasmBindgenSrc;
+            cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+              src = wasmBindgenSrc;
+              inherit (wasmBindgenSrc) pname version;
+              hash = "sha256-Inup6vvJSG5ghNyeDPyZbfZo4d0LsMG2OJfStoaeDBs=";
+            };
+          };
+          mkDevShell = toolchain: pkgs.mkShell {
             name = "issundb-dev";
-
             packages = [
-              rustToolchain
+              toolchain
               pkgs.pkg-config
-              pkgs.cmake
               pkgs.gnumake
               pkgs.graphviz
               pkgs.python313
               pkgs.uv
               pkgs.maturin
               pkgs.openssl
-              pkgs.llvmPackages.libclang
-              pkgs.clang
               pkgs.pre-commit
               pkgs.zig
               pkgs.cargo-zigbuild
-
-              # Dev tools used in Makefile
+              pkgs.nodejs
+              wasmBindgen
+              pkgs.actionlint
               pkgs.cargo-llvm-cov
               pkgs.cargo-audit
               pkgs.cargo-careful
               pkgs.cargo-nextest
               pkgs.cargo-deny
-            ] ++ darwinDeps;
-
-            # We set LIBCLANG_PATH for rust-bindgen to work properly.
-            shellHook = ''
-              export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-              echo "=========================================================="
-              echo "  Welcome to the IssunDB development environment!        "
-              echo "  Rust version:  $(rustc --version)                       "
-              echo "  Python:        $(python3 --version 2>/dev/null || echo 'not found')"
-              echo "=========================================================="
-            '';
+            ];
+          };
+        in
+        {
+          default = mkDevShell (msrv.override {
+            targets = [ "wasm32-unknown-unknown" ];
+          });
+          stable = mkDevShell rustToolchain;
+          msrv = mkDevShell msrv;
+          ladybugdb = mkDevShell benchmarkToolchain;
+          # Release artifacts must link against the runner's libraries, not /nix/store.
+          release = pkgs.mkShellNoCC {
+            packages = [ rustToolchain pkgs.pkg-config pkgs.maturin ];
+            CC = "/usr/bin/cc";
+            CXX = "/usr/bin/c++";
+            "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] pkgs.stdenv.hostPlatform.rust.rustcTarget)}_LINKER" = "/usr/bin/cc";
           };
         });
 

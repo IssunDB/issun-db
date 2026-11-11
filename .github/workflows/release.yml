@@ -110,24 +110,36 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Rust (stable)
+      - name: Set up Nix
+        if: runner.os != 'Windows'
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Unix Rust build artifacts
+        if: runner.os != 'Windows'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Set up Rust (Windows)
+        if: runner.os == 'Windows'
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           cache: true
           cache-key: release-${{ matrix.name }}
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
-
       - name: Configure macOS linker workaround
         if: matrix.runner == 'macos-14'
-        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> "$GITHUB_ENV"
 
-      - name: Build release binaries
+      - name: Build release binaries (Unix)
+        if: runner.os != 'Windows'
+        run: nix develop .#release --no-update-lock-file -c cargo build --release --locked -p issundb-cli -p issundb-rest -p issundb-mcp
+
+      - name: Build release binaries (Windows)
+        if: runner.os == 'Windows'
         run: cargo build --release -p issundb-cli -p issundb-rest -p issundb-mcp ${{ matrix.build_flags || '' }}
 
       - name: Package release asset (Unix)
@@ -203,7 +215,7 @@ jobs:
 
       - name: Downcase registry owner
         run: |
-          echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> ${GITHUB_ENV}
+          echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
 
       - name: Extract Docker metadata
         id: meta

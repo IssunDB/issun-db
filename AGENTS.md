@@ -15,6 +15,9 @@ Priorities, in order:
 ## Core Rules
 
 - Use English for code, comments, docs, and tests.
+- Run development commands in the locked Nix environment: `nix develop -c <command>`.
+  Use `.#msrv` for MSRV checks, `.#stable` for coverage, and `.#ladybugdb` for the comparison harness.
+  Keep shared tool definitions in `flake.nix` and their input versions in `flake.lock`.
 - Prefer small, focused changes over broad rewrites.
 - Keep the workspace modular: `issundb-core` owns graph storage, `issundb-vector` owns vector search, `issundb-text` owns full-text search,
   `issundb-retrieval` owns hybrid retrieval, `issundb-cypher` owns the query layer, `issundb` is the public facade, and the consumer crates

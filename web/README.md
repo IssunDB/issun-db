@@ -68,9 +68,10 @@ for it.
 ## Running It
 
 ```bash
-make playground-deps    # once: the wasm target and the matching wasm-bindgen CLI
-make playground-build   # compile the module into web/pkg/
-make playground-serve   # http://localhost:8000
+nix develop             # Provides the wasm target, wasm-bindgen CLI, Node.js, and Python
+make playground-deps    # Verify the wasm target and matching CLI
+make playground-build   # Compile the module into web/pkg/
+make playground-serve   # Make the app avaible on http://localhost:8000
 ```
 
 A module cannot be loaded over `file://`, so the page has to be served over HTTP. Any

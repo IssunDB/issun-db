@@ -10,10 +10,11 @@ misunderstanding of Cypher looks like agreement.
 ### Running the Harness
 
 ```bash
-make test-ladybugdb       # differential correctness only, no timing
-make test-ladybugdb-zipf  # the same under a skewed degree distribution
-make bench-ladybugdb      # timing comparison (runs the curated differential pass first)
-# Or directly (from this directory, so the local toolchain pin applies):
+nix develop .#ladybugdb  # From the repository root; supplies the harness's Rust version
+make test-ladybugdb       # Differential correctness only, no timing
+make test-ladybugdb-zipf  # The same under a skewed degree distribution
+make bench-ladybugdb      # Timing comparison (runs the curated differential pass first)
+# Or directly from that shell
 cd benchmarks/ladybugdb-compare && cargo run --release
 ```
 

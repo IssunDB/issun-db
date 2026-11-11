@@ -5,6 +5,10 @@ It explains prerequisites, building the engine from source, and using the comman
 
 ## Prerequisites
 
+For repository development on Linux and macOS, use the locked Nix environment.
+Install [Nix](https://nixos.org/download/) with flakes enabled. `nix develop`
+provides Rust, the native compiler, Python, and the development tools used in CI.
+
 Compiling IssunDB and its dependencies needs Rust 1.85.0 or later, along with one system tool:
 
 - Build tools: a C/C++ compiler (such as Clang or GCC), which compiles the bundled LMDB sources and the vector index.
@@ -22,6 +26,9 @@ To clone the repository and compile the workspace components (including the stor
 # Clone the repository (with Git submodules included)
 git clone --recursive https://github.com/IssunDB/issun-db.git
 cd issun-db
+
+# Make sure you have Nix (with flakes enabled) installed
+nix develop
 
 # Build release binaries (this can take a while the first time)
 make build

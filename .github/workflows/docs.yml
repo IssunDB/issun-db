@@ -21,25 +21,23 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: nix develop --no-update-lock-file -c bash -euo pipefail {0}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install a stable Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Add the wasm target to the pinned toolchain
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Install the matching wasm-bindgen CLI
-        run: |
-          VERSION=$(cargo metadata --format-version 1 | python3 -c \
-            "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='wasm-bindgen'))")
-          echo "Installing wasm-bindgen-cli $VERSION"
-          cargo +stable install --locked wasm-bindgen-cli --version "$VERSION"
+      - name: Verify the playground tools
+        run: make playground-deps
 
       - name: Stamp the playground build
         run: echo "ISSUNDB_BUILD_REF=${GITHUB_REF_NAME}@${GITHUB_SHA:0:5}" >> "$GITHUB_ENV"
@@ -50,19 +48,8 @@ jobs:
       - name: Build the playground module
         run: make playground-build
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-          version: "latest"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
 
       - name: Build IssunDB docs
         run: uv run mkdocs build
