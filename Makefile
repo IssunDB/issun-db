@@ -21,6 +21,7 @@ NEXTEST_RETRIES ?= 2
 # Differential testing parameters
 LADYBUGDB_DIFF_NODES ?= 5000
 LADYBUGDB_DIFF_GENERATED ?= 500
+LADYBUGDB_CARGO = nix develop "$(CURDIR)\#ladybugdb" --no-update-lock-file -c cargo
 
 # Playground (web build) parameters
 PLAYGROUND_DIR := web
@@ -349,37 +350,37 @@ test-ladybugdb: ## Run the differential tests (using LadybugDB)
 	@echo "Running LadybugDB differential pass (issundb fast paths)..."
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 	@echo "Running LadybugDB differential pass (issundb row pipeline)..."
 	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 
 .PHONY: test-ladybugdb-zipf
 test-ladybugdb-zipf: ## Run the differential tests (using LadybugDB) under Zipf degree skew
 	@echo "Running differential tests (using LadybugDB) (with Zipf skew)..."
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 	@echo "Running differential tests (using LadybugDB) (with Zipf skew, row pipeline)..."
 	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_SKEW=zipf \
 		LADYBUGDB_COMPARE_DIFF_ONLY=1 LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb
 bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)
 	@echo "Running LadybugDB comparison harness..."
-	@cd benchmarks/ladybugdb-compare && cargo run --release
+	@cd benchmarks/ladybugdb-compare && $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb-zipf
 bench-ladybugdb-zipf: ## Run the LadybugDB comparison harness under Zipf degree skew
 	@echo "Running LadybugDB comparison harness (with Zipf skew)..."
-	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf cargo run --release
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb-sweep
 bench-ladybugdb-sweep: ## Run the LadybugDB comparison harness across three dataset sizes
 	@echo "Running LadybugDB comparison harness (size sweep)..."
-	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SWEEP=1 cargo run --release
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SWEEP=1 $(LADYBUGDB_CARGO) run --release
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies
