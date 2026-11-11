@@ -230,12 +230,8 @@ pub(super) fn encode_property_value(val: &serde_json::Value) -> Option<Vec<u8>> 
             } else {
                 bits ^ SORT_SIGN_BIT
             };
-            // Integer disambiguator: for any number whose exact real value is an
-            // integer in `i64` range, store that integer in sign-flipped
-            // big-endian order so distinct large integers never collide. All
-            // other numbers (non-integers, out-of-range) get a fixed sentinel;
-            // they already have a unique `f64` bit pattern in the primary key,
-            // so the sentinel value cannot affect ordering or equality.
+            // Preserve the legacy disambiguator for existing databases. It distinguishes
+            // signed integers, but unsigned collisions require stored-value verification.
             let int_disambig: u64 = if let Some(i) = num.as_i64() {
                 (i as u64) ^ SORT_SIGN_BIT
             } else if float_val.fract() == 0.0
@@ -272,6 +268,85 @@ const POSITIVE_ZERO_ENCODING: [u8; 17] = [3, 128, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0
 const NEGATIVE_ZERO_ENCODING: [u8; 17] = [
     3, 127, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0,
 ];
+
+fn integer_value(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+// The persisted integer disambiguator saturates at the signed boundary and omits larger unsigned values.
+fn numeric_index_may_collide(value: &serde_json::Value) -> bool {
+    value.as_f64().is_some_and(|n| n >= i64::MAX as f64)
+}
+
+fn compare_property_values(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+) -> Option<std::cmp::Ordering> {
+    use serde_json::Value;
+    fn int_float(i: i128, f: f64) -> Option<std::cmp::Ordering> {
+        // Compare the integer part first so converting a large integer to f64 cannot round it.
+        let order = i.cmp(&(f as i128));
+        if order.is_eq() {
+            0.0_f64.partial_cmp(&f.fract())
+        } else {
+            Some(order)
+        }
+    }
+    match (a, b) {
+        (Value::Number(a), Value::Number(b)) => match (integer_value(a), integer_value(b)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            (Some(a), None) => int_float(a, b.as_f64()?),
+            (None, Some(b)) => int_float(b, a.as_f64()?).map(std::cmp::Ordering::reverse),
+            (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        },
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+fn property_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a.is_number() && b.is_number() {
+        compare_property_values(a, b) == Some(std::cmp::Ordering::Equal)
+    } else {
+        a == b
+    }
+}
+
+// This identity is for constraint backfills only; persisted index keys stay unchanged.
+fn unique_property_key(value: &serde_json::Value) -> Vec<u8> {
+    if let serde_json::Value::Number(n) = value {
+        let integer = integer_value(n).or_else(|| {
+            n.as_f64()
+                .filter(|f| f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= u64::MAX as f64)
+                .map(|f| f as i128)
+        });
+        if let Some(i) = integer {
+            return format!("number:{i}").into_bytes();
+        }
+    }
+    value.to_string().into_bytes()
+}
+
+fn property_in_range(
+    value: &serde_json::Value,
+    min: Option<&serde_json::Value>,
+    min_inclusive: bool,
+    max: Option<&serde_json::Value>,
+    max_inclusive: bool,
+) -> bool {
+    !value.is_null()
+        && min.is_none_or(|bound| {
+            compare_property_values(value, bound)
+                .is_some_and(|order| order.is_gt() || (min_inclusive && order.is_eq()))
+        })
+        && max.is_none_or(|bound| {
+            compare_property_values(value, bound)
+                .is_some_and(|order| order.is_lt() || (max_inclusive && order.is_eq()))
+        })
+}
 
 // Preserve stored keys, including negative zero, while comparing both signs as equal.
 pub(super) fn normalized_property_encoding(encoded: &[u8]) -> &[u8] {
@@ -575,6 +650,7 @@ pub struct Graph {
     /// handle's identity and the count of schema changes. See
     /// [`Graph::plan_generation`].
     pub(super) plan_epoch: Arc<PlanEpoch>,
+    pub(super) vector_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Type-erased extension cache. Higher-level crates attach caches (e.g. the
     /// HNSW vector index) to a Graph without creating a circular dependency,
     /// through the `get_extension`, `set_extension`, and
@@ -630,6 +706,7 @@ pub struct ReadTxn<'a> {
 
 /// A read-write transaction on the graph.
 pub struct WriteTxn<'a> {
+    vectors_changed: bool,
     pub(super) graph: &'a Graph,
     pub(super) wtxn: crate::storage::RwTxn<'a>,
     pub(super) mutations_count: usize,
@@ -993,6 +1070,7 @@ impl Graph {
             label_scans: Arc::new(parking_lot::Mutex::new(index::LabelScanCache::default())),
             n_threads: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             plan_epoch: Arc::new(PlanEpoch::new()),
+            vector_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             extensions: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
             #[cfg(test)]
             test_hooks: Arc::new(TestHooks::default()),
@@ -1558,6 +1636,7 @@ impl Graph {
         let _guard = self._write_lock.lock();
         let wtxn = self.storage.env.write_txn()?;
         let mut txn = WriteTxn {
+            vectors_changed: false,
             graph: self,
             wtxn,
             mutations_count: 0,
@@ -1581,6 +1660,7 @@ impl Graph {
         match outcome {
             Ok(val) => {
                 let WriteTxn {
+                    vectors_changed,
                     wtxn,
                     mutations_count,
                     failed: _,
@@ -1603,6 +1683,9 @@ impl Graph {
                     }
                 };
                 self.commit_and_publish(wtxn, mutations_count, change)?;
+                if vectors_changed {
+                    self.advance_vector_generation();
+                }
                 #[cfg(test)]
                 TestHooks::fire(&self.test_hooks.after_commit_before_column_bookkeeping);
                 // Column bookkeeping next. The CSR snapshot got its record inside
@@ -1853,6 +1936,54 @@ mod encode_tests {
     use serde_json::json;
 
     use super::{MAX_INDEXED_STRING_LEN, decode_property_value, encode_property_value};
+
+    #[test]
+    fn numeric_comparisons_and_constraint_identity_preserve_integer_precision() {
+        let groups = [
+            vec![json!(-1e100)],
+            vec![json!(i64::MIN), json!(i64::MIN as f64)],
+            vec![json!(-9_007_199_254_740_993_i64)],
+            vec![
+                json!(-9_007_199_254_740_992_i64),
+                json!(-9_007_199_254_740_992_f64),
+            ],
+            vec![json!(-1.5)],
+            vec![json!(-1), json!(-1.0)],
+            vec![json!(-0.5)],
+            vec![json!(0), json!(0.0), json!(-0.0)],
+            vec![json!(0.5)],
+            vec![json!(1), json!(1.0)],
+            vec![
+                json!(9_007_199_254_740_992_i64),
+                json!(9_007_199_254_740_992_f64),
+            ],
+            vec![json!(9_007_199_254_740_993_i64)],
+            vec![json!(i64::MAX)],
+            vec![json!(1_u64 << 63), json!((1_u64 << 63) as f64)],
+            vec![json!((1_u64 << 63) + 1)],
+            vec![json!(u64::MAX)],
+            vec![json!(u64::MAX as f64)],
+            vec![json!(1e100)],
+        ];
+        for (i, a_group) in groups.iter().enumerate() {
+            for (j, b_group) in groups.iter().enumerate() {
+                for a in a_group {
+                    for b in b_group {
+                        assert_eq!(
+                            super::compare_property_values(a, b),
+                            Some(i.cmp(&j)),
+                            "{a}, {b}"
+                        );
+                        assert_eq!(
+                            super::unique_property_key(a) == super::unique_property_key(b),
+                            i == j,
+                            "{a}, {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// A string up to the indexable bound encodes and round-trips; one byte over
     /// the bound is declined so it never overflows the LMDB key size.

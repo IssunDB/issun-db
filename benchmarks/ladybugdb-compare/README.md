@@ -10,12 +10,16 @@ misunderstanding of Cypher looks like agreement.
 ### Running the Harness
 
 ```bash
-make test-ladybugdb       # differential correctness only, no timing
-make test-ladybugdb-zipf  # the same under a skewed degree distribution
-make bench-ladybugdb      # timing comparison (runs the curated differential pass first)
-# Or directly (from this directory, so the local toolchain pin applies):
-cd benchmarks/ladybugdb-compare && cargo run --release
+make test-ladybugdb       # Differential correctness only, no timing
+make test-ladybugdb-zipf  # The same under a skewed degree distribution
+make bench-ladybugdb      # Timing comparison (runs the curated differential pass first)
+# Or directly with the harness's Nix shell
+nix develop .#ladybugdb -c cargo run --release --manifest-path benchmarks/ladybugdb-compare/Cargo.toml
 ```
+
+All LadybugDB Make targets select the `ladybugdb` Nix shell automatically, including
+when called from the default development shell. Its Rust version comes from this
+directory's `rust-toolchain.toml`; the default shell's compiler does not apply.
 
 `make test-ladybugdb` runs the differential passes twice, once normally and once with `ISSUNDB_ROW_PIPELINE_ONLY=1`, so both IssunDB's fast paths and its
 general row pipeline are checked. Size and breadth come from `LADYBUGDB_DIFF_NODES` and `LADYBUGDB_DIFF_GENERATED` in the root Makefile; raise the latter

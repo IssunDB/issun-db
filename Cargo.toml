@@ -8,7 +8,7 @@ exclude = ["benchmarks/ladybugdb-compare"]
 
 
 [workspace.package]
-version = "0.1.0-alpha.30"
+version = "0.1.0-alpha.31"
 edition = "2024"
 authors = ["Hassan Abedi <hassan.abedi.t+issundb@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -18,13 +18,13 @@ rust-version = "1.85.0"
 
 
 [workspace.dependencies]
-issundb = { path = "crates/issundb", version = "0.1.0-alpha.30", default-features = false }
-issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.30", default-features = false }
-issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.30", default-features = false }
-issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.30", default-features = false }
-issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.30", default-features = false }
-issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.30", default-features = false }
-heed = "0.22"
+issundb = { path = "crates/issundb", version = "0.1.0-alpha.31", default-features = false }
+issundb-core = { path = "crates/issundb-core", version = "0.1.0-alpha.31", default-features = false }
+issundb-vector = { path = "crates/issundb-vector", version = "0.1.0-alpha.31", default-features = false }
+issundb-text = { path = "crates/issundb-text", version = "0.1.0-alpha.31", default-features = false }
+issundb-retrieval = { path = "crates/issundb-retrieval", version = "0.1.0-alpha.31", default-features = false }
+issundb-cypher = { path = "crates/issundb-cypher", version = "0.1.0-alpha.31", default-features = false }
+heed = "=0.22.0"
 memmap2 = "0.9"
 colored = "3.1.1"
 byteorder = "1"
@@ -32,7 +32,7 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-parking_lot = "0.12"
+parking_lot = "=0.12"
 arc-swap = "1"
 crossbeam = "0.8"
 thiserror = "2"
@@ -53,14 +53,14 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 rust-stemmers = "1.2.0"
 unicode-segmentation = "1.13.2"
-pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
+pyo3 = { version = "0.30.1", features = ["abi3-py310"] }
 walkdir = "2"
 gherkin = "=0.14"
 roaring = "=0.10"
 deepsize = { version = "0.2", features = ["derive"] }
-parquet = "59.0.0"
-arrow-array = "59.0.0"
-arrow-schema = "59.0.0"
+parquet = "=59.3.0"
+arrow-array = "=59.3.0"
+arrow-schema = "=59.3.0"
 terminal_size = "0.4"
 
 [profile.release]

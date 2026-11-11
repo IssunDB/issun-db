@@ -303,7 +303,13 @@ pub(crate) fn lexer<'src>()
 
     // Backtick-quoted identifier: `my prop`
     let backtick_ident = just('`')
-        .ignore_then(none_of("`").repeated().collect::<String>())
+        .ignore_then(
+            just("``")
+                .to('`')
+                .or(none_of("`"))
+                .repeated()
+                .collect::<String>(),
+        )
         .then_ignore(just('`'))
         .map(Tok::Ident);
 

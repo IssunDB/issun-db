@@ -435,6 +435,7 @@ impl<'a> WriteTxn<'a> {
             // in first.
             txn.cache
                 .flush_adjacency(&txn.graph.storage, &mut txn.wtxn)?;
+            txn.vectors_changed |= txn.graph.storage.vectors.get(&txn.wtxn, &id)?.is_some();
             txn.graph
                 .delete_node_inner(&mut txn.wtxn, Some(&mut txn.cache), id)?;
             txn.mutations_count += 1;
@@ -498,6 +499,7 @@ impl<'a> WriteTxn<'a> {
     pub fn put_vector_bytes(&mut self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
         self.mutate(|txn| {
             txn.graph.put_vector_bytes_impl(&mut txn.wtxn, n, bytes)?;
+            txn.vectors_changed = true;
             txn.mutations_count += 1;
             Ok(())
         })
@@ -508,6 +510,7 @@ impl<'a> WriteTxn<'a> {
     pub fn delete_vector_bytes(&mut self, n: NodeId) -> Result<(), Error> {
         self.mutate(|txn| {
             txn.graph.delete_vector_bytes_impl(&mut txn.wtxn, n)?;
+            txn.vectors_changed = true;
             txn.mutations_count += 1;
             Ok(())
         })

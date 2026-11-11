@@ -6,6 +6,23 @@ use super::*;
 const VECTOR_CONFIG_KEY: &str = "vector_config";
 
 impl Graph {
+    /// Coordinate a vector cache mutation with committed graph writes.
+    #[doc(hidden)]
+    pub fn with_vector_write_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self._write_lock.lock();
+        f()
+    }
+
+    /// Generation of committed raw vector writes, shared by cloned handles.
+    #[doc(hidden)]
+    pub fn vector_generation(&self) -> u64 {
+        self.vector_gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn advance_vector_generation(&self) {
+        self.vector_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     // ------------------------------------------------------------------
     // Vector storage
     // ------------------------------------------------------------------
@@ -16,6 +33,7 @@ impl Graph {
     /// only stores the opaque record under a fixed `meta` key.
     #[doc(hidden)]
     pub fn put_vector_config(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.storage.meta.put(&mut wtxn, VECTOR_CONFIG_KEY, bytes)?;
@@ -41,10 +59,12 @@ impl Graph {
     /// `issundb-core` only owns the durable LMDB record.
     #[doc(hidden)]
     pub fn put_vector_bytes(&self, n: NodeId, bytes: &[u8]) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.put_vector_bytes_impl(&mut wtxn, n, bytes)?;
         wtxn.commit()?;
+        self.advance_vector_generation();
         Ok(())
     }
 
@@ -61,10 +81,12 @@ impl Graph {
     /// Delete the raw vector bytes for `n` from LMDB. No-op if absent.
     #[doc(hidden)]
     pub fn delete_vector_bytes(&self, n: NodeId) -> Result<(), Error> {
+        self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
         self.delete_vector_bytes_impl(&mut wtxn, n)?;
         wtxn.commit()?;
+        self.advance_vector_generation();
         Ok(())
     }
 

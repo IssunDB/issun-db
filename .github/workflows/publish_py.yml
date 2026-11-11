@@ -90,16 +90,28 @@ jobs:
           python-version: "3.10"
 
       - name: Set up Rust
+        if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.85.0'
           targets: ${{ matrix.target }}
 
+      - name: Set up Nix
+        if: runner.os == 'macOS'
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Configure macOS linker workaround
         if: matrix.os == 'macos-14'
-        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> $GITHUB_ENV
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> "$GITHUB_ENV"
 
-      - name: Build wheel
+      - name: Build wheel (macOS)
+        if: runner.os == 'macOS'
+        run: nix develop .#release --no-update-lock-file -c maturin build --manifest-path crates/issundb-py/Cargo.toml --release --out crates/issundb-py/dist --target ${{ matrix.target }}
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
         run: |
           cd crates/issundb-py
           pip install maturin
@@ -122,14 +134,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
         with:
-          python-version: "3.10"
-
-      - name: Install uv
-        run: |
-          pip install uv twine
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -140,9 +148,11 @@ jobs:
       - name: Verify wheels
         run: |
           ls -la wheels/
-          twine check wheels/*
+          nix develop --no-update-lock-file -c uv publish --dry-run wheels/*
 
       - name: Publish wheels to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          twine upload wheels/* -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
+          nix develop --no-update-lock-file -c uv publish wheels/*
         if: success()

@@ -1,10 +1,8 @@
 # Variables
 BINARY := target/release/issundb-cli
-export PATH := /snap/bin:$(PATH)
 ASSET_DIR := docs/assets/diagrams
 SCRIPTS_DIR := scripts
 SHELL := /bin/bash
-MSRV := 1.85.0
 DEBUG_PROJ ?= 0
 RUST_BACKTRACE ?= 1
 
@@ -16,12 +14,6 @@ PY_MNGR := uv
 # Latest built issundb wheel, used by the publish target
 WHEEL_FILE = $(shell ls $(PY_DIR)/$(WHEEL_DIR)/issundb-*.whl 2>/dev/null | head -n 1)
 
-# Pinned versions for development tools
-LLVM_COV_VERSION := 0.6.16
-NEXTEST_VERSION := 0.9.100
-AUDIT_VERSION := 0.21.2
-CAREFUL_VERSION := 0.4.8
-
 # Multithreading parameters
 OMP_NUM_THREADS ?= 1
 NEXTEST_RETRIES ?= 2
@@ -29,6 +21,7 @@ NEXTEST_RETRIES ?= 2
 # Differential testing parameters
 LADYBUGDB_DIFF_NODES ?= 5000
 LADYBUGDB_DIFF_GENERATED ?= 500
+LADYBUGDB_CARGO = nix develop "$(CURDIR)\#ladybugdb" --no-update-lock-file -c cargo
 
 # Playground (web build) parameters
 PLAYGROUND_DIR := web
@@ -145,33 +138,18 @@ clean: ## Remove generated and temporary files
 	@rm -f $(PY_DIR)/python/issundb/*.so
 	@test -n "$(ASSET_DIR)" && rm -f $(ASSET_DIR)/*.svg && echo "Removed SVG files; might want to run 'make figs' to regenerate them."
 
-.PHONY: install-snap
-install-snap: ## Install a few dependencies using Snapcraft
-	@echo "Installing the snap package..."
-	@sudo apt-get update
-	@sudo apt-get install -y snapd graphviz wget
-	@sudo snap refresh
-	@sudo snap install rustup --classic
-
 .PHONY: submodules
 submodules: ## Initialize and update all git submodules recursively
 	@echo "Initializing and updating all git submodules..."
 	@git submodule update --init --recursive
 
 .PHONY: install-deps
-install-deps: install-snap submodules ## Install development dependencies
-	@echo "Installing dependencies..."
-	@rustup component add rustfmt clippy llvm-tools-preview
-	@cargo install --locked cargo-llvm-cov --version $(LLVM_COV_VERSION)
-	@cargo install --locked cargo-audit --version $(AUDIT_VERSION)
-	@cargo install --locked cargo-careful --version $(CAREFUL_VERSION)
-	@cargo install --locked cargo-nextest --version $(NEXTEST_VERSION)
+install-deps: submodules ## Prepare the locked Nix development environment
+	@nix develop --no-update-lock-file -c true
 
 .PHONY: install-msrv
-install-msrv: ## Install the minimum supported Rust version (MSRV=$(MSRV)) and set it as the default toolchain
-	@echo "Installing MSRV toolchain ($(MSRV))..."
-	@rustup toolchain install $(MSRV)
-	@rustup default $(MSRV)
+install-msrv: ## Prepare the Nix environment with the minimum supported Rust version
+	@nix develop .\#msrv --no-update-lock-file -c rustc --version
 
 .PHONY: lint
 lint: format ## Run the linters
@@ -241,7 +219,7 @@ publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (needs PY
 	   exit 1; \
 	fi
 	@echo "Found wheel file: $(WHEEL_FILE)"
-	@twine upload -u __token__ -p $(PYPI_TOKEN) $(WHEEL_FILE)
+	@UV_PUBLISH_TOKEN="$(PYPI_TOKEN)" $(PY_MNGR) publish "$(WHEEL_FILE)"
 
 .PHONY: repl
 repl: ## Launch the REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)
@@ -271,15 +249,8 @@ rest: ## Launch the HTTP REST API server (pass REST_PATH=<dir> db path, REST_HOS
 ########################################################################################
 
 .PHONY: playground-deps
-playground-deps: ## Install the wasm target and the matching wasm-bindgen CLI
-	@echo "Installing the wasm32-unknown-unknown target..."
-	@rustup target add wasm32-unknown-unknown
-	@# Resolved from Cargo.lock rather than pinned, so this cannot install a version that
-	@# check-wasm-bindgen then rejects. On stable because the CLI's own MSRV is above ours.
-	@rustup toolchain install stable --profile minimal
-	@VERSION=$$($(WASM_BINDGEN_CRATE_VERSION)); \
-	echo "Installing wasm-bindgen-cli $$VERSION (matching the crate)..."; \
-	cargo +stable install --locked wasm-bindgen-cli --version "$$VERSION"
+playground-deps: check-wasm-bindgen ## Verify the playground tools supplied by nix develop
+	@rustc --print target-libdir --target wasm32-unknown-unknown | xargs test -d
 
 .PHONY: playground-build
 playground-build: check-wasm-bindgen check-wasm-stack ## Build the browser module into web/pkg
@@ -324,12 +295,12 @@ check-wasm-stack:
 .PHONY: check-wasm-bindgen
 check-wasm-bindgen:
 	@command -v wasm-bindgen >/dev/null || \
-		{ echo "wasm-bindgen not found. Run 'make playground-deps'."; exit 1; }
+		{ echo "wasm-bindgen not found. Enter the environment with 'nix develop'."; exit 1; }
 	@CLI=$$(wasm-bindgen --version | awk '{print $$2}'); \
 	CRATE=$$($(WASM_BINDGEN_CRATE_VERSION)); \
 	if [ "$$CLI" != "$$CRATE" ]; then \
 		echo "wasm-bindgen CLI is $$CLI but the crate is $$CRATE."; \
-		echo "Run: cargo install --locked wasm-bindgen-cli --version $$CRATE"; \
+		echo "Update the wasm-bindgen CLI package in flake.nix to match Cargo.lock."; \
 		exit 1; \
 	fi
 
@@ -379,37 +350,37 @@ test-ladybugdb: ## Run the differential tests (using LadybugDB)
 	@echo "Running LadybugDB differential pass (issundb fast paths)..."
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 	@echo "Running LadybugDB differential pass (issundb row pipeline)..."
 	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 
 .PHONY: test-ladybugdb-zipf
 test-ladybugdb-zipf: ## Run the differential tests (using LadybugDB) under Zipf degree skew
 	@echo "Running differential tests (using LadybugDB) (with Zipf skew)..."
 	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf LADYBUGDB_COMPARE_DIFF_ONLY=1 \
 		LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 	@echo "Running differential tests (using LadybugDB) (with Zipf skew, row pipeline)..."
 	@cd benchmarks/ladybugdb-compare && ISSUNDB_ROW_PIPELINE_ONLY=1 LADYBUGDB_COMPARE_SKEW=zipf \
 		LADYBUGDB_COMPARE_DIFF_ONLY=1 LADYBUGDB_COMPARE_NODES=$(LADYBUGDB_DIFF_NODES) \
-		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) cargo run --release
+		LADYBUGDB_COMPARE_GENERATED=$(LADYBUGDB_DIFF_GENERATED) $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb
 bench-ladybugdb: ## Run the LadybugDB comparison harness (uniform skew)
 	@echo "Running LadybugDB comparison harness..."
-	@cd benchmarks/ladybugdb-compare && cargo run --release
+	@cd benchmarks/ladybugdb-compare && $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb-zipf
 bench-ladybugdb-zipf: ## Run the LadybugDB comparison harness under Zipf degree skew
 	@echo "Running LadybugDB comparison harness (with Zipf skew)..."
-	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf cargo run --release
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SKEW=zipf $(LADYBUGDB_CARGO) run --release
 
 .PHONY: bench-ladybugdb-sweep
 bench-ladybugdb-sweep: ## Run the LadybugDB comparison harness across three dataset sizes
 	@echo "Running LadybugDB comparison harness (size sweep)..."
-	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SWEEP=1 cargo run --release
+	@cd benchmarks/ladybugdb-compare && LADYBUGDB_COMPARE_SWEEP=1 $(LADYBUGDB_CARGO) run --release
 
 .PHONY: audit
 audit: ## Run security audit on Rust dependencies

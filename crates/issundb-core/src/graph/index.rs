@@ -342,7 +342,7 @@ impl Graph {
 
     /// Enforce a unique constraint for one edge property value, excluding the
     /// edge itself. An index-encodable value is checked via `edge_prop_idx`
-    /// (exact encoded-value match, so `30` and `30.0` conflict); a value too
+    /// with stored-value verification for rounded numeric collisions. A value too
     /// long to index falls back to a type scan comparing stored values, so the
     /// constraint holds for long strings that never reach the index. Mirrors
     /// `check_node_property_unique`.
@@ -376,6 +376,18 @@ impl Graph {
                     // match is a distinct string value (see `exact_prop_index_id`).
                     if let Some(found_edge_id) = exact_prop_index_id(key, encoding) {
                         if found_edge_id != edge_id {
+                            if numeric_index_may_collide(val) {
+                                let record = self
+                                    .get_edge_impl(wtxn, found_edge_id)?
+                                    .ok_or(Error::EdgeNotFound(found_edge_id))?;
+                                let props: serde_json::Value = props::decode(&record.props)?;
+                                if !props
+                                    .get(prop_name)
+                                    .is_some_and(|stored| property_values_equal(stored, val))
+                                {
+                                    continue;
+                                }
+                            }
                             return Err(violation());
                         }
                     }
@@ -602,12 +614,7 @@ impl Graph {
         }
 
         let node_ids = self.nodes_by_label_impl(wtxn, label)?;
-        // Dedup on the same notion of value identity the insert-time check uses:
-        // an encodable value by its order-preserving encoding (so `30` and `30.0`
-        // collide, as they do at insert time), a value too long to index by a
-        // tagged copy of its exact JSON form (the `0xFF` tag cannot collide with
-        // an encoded value's type tag). Without this the backfill accepted data
-        // that a later insert would reject, creating an unenforceable constraint.
+        // Compare exact values, because persisted numeric keys can collide after rounding.
         let mut seen_values: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
 
         for node_id in &node_ids {
@@ -626,14 +633,7 @@ impl Graph {
 
             if let Some(val) = prop_val {
                 if flags == 0x01 && val != &serde_json::Value::Null {
-                    let mut key = encode_property_value(val).unwrap_or_else(|| {
-                        let mut k = vec![0xFF];
-                        k.extend_from_slice(val.to_string().as_bytes());
-                        k
-                    });
-                    if key == NEGATIVE_ZERO_ENCODING {
-                        key.copy_from_slice(&POSITIVE_ZERO_ENCODING);
-                    }
+                    let key = unique_property_key(val);
                     if !seen_values.insert(key) {
                         return Err(Error::UniqueConstraintViolation(
                             label.to_string(),
@@ -794,11 +794,7 @@ impl Graph {
         }
 
         let edge_ids = self.edges_by_type_impl(wtxn, etype)?;
-        // Dedup on the same notion of value identity the insert-time check uses
-        // (see `create_node_index_impl`): an encodable value by its
-        // order-preserving encoding (so `30` and `30.0` collide, as they do at
-        // insert time), a value too long to index by a tagged copy of its exact
-        // JSON form. Explicit nulls never conflict, matching the insert path.
+        // Use the same exact value identity as the node constraint backfill.
         let mut seen_values: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
 
         for edge_id in &edge_ids {
@@ -817,14 +813,7 @@ impl Graph {
 
             if let Some(val) = prop_val {
                 if flags == 0x01 && val != &serde_json::Value::Null {
-                    let mut key = encode_property_value(val).unwrap_or_else(|| {
-                        let mut k = vec![0xFF];
-                        k.extend_from_slice(val.to_string().as_bytes());
-                        k
-                    });
-                    if key == NEGATIVE_ZERO_ENCODING {
-                        key.copy_from_slice(&POSITIVE_ZERO_ENCODING);
-                    }
+                    let key = unique_property_key(val);
                     if !seen_values.insert(key) {
                         return Err(Error::UniqueConstraintViolation(
                             etype.to_string(),
@@ -990,6 +979,18 @@ impl Graph {
                 // stored "a\0", so require the value segment to equal `encoded`
                 // exactly.
                 if let Some(node_id) = exact_prop_index_id(key, encoding) {
+                    if numeric_index_may_collide(&val) {
+                        let record = self
+                            .get_node_impl(rtxn, node_id)?
+                            .ok_or(Error::NodeNotFound(node_id))?;
+                        let props: serde_json::Value = props::decode(&record.props)?;
+                        if !props
+                            .get(property)
+                            .is_some_and(|stored| property_values_equal(stored, &val))
+                        {
+                            continue;
+                        }
+                    }
                     result.push(node_id);
                 }
             }
@@ -1010,19 +1011,14 @@ impl Graph {
         property: &str,
         val: &serde_json::Value,
     ) -> Result<Vec<NodeId>, Error> {
-        // Numbers compare by value so `30` matches `30.0`, as the index's
-        // numeric encoding does; everything else compares structurally.
-        let matches = |stored: &serde_json::Value| match (stored, val) {
-            (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-                a.as_f64() == b.as_f64()
-            }
-            _ => stored == val,
-        };
         let mut result = Vec::new();
         for id in self.nodes_by_label_impl(rtxn, label)? {
             if let Some(record) = self.get_node_impl(rtxn, id)? {
                 let props: serde_json::Value = props::decode(&record.props)?;
-                if props.get(property).is_some_and(matches) {
+                if props
+                    .get(property)
+                    .is_some_and(|stored| property_values_equal(stored, val))
+                {
                     result.push(id);
                 }
             }
@@ -1096,83 +1092,23 @@ impl Graph {
         max_val: Option<PropValue>,
         max_inclusive: bool,
     ) -> Result<Vec<NodeId>, Error> {
-        #[derive(PartialEq, Clone, Copy)]
-        enum Family {
-            Number,
-            Str,
-            Bool,
-        }
-        fn family(v: &PropValue) -> Family {
-            match v {
-                PropValue::Int(_) | PropValue::Float(_) => Family::Number,
-                PropValue::Str(_) => Family::Str,
-                PropValue::Bool(_) => Family::Bool,
-            }
-        }
-        let fam = match (&min_val, &max_val) {
-            (Some(lo), Some(hi)) if family(lo) != family(hi) => return Ok(Vec::new()),
-            (Some(b), _) | (None, Some(b)) => Some(family(b)),
-            (None, None) => None,
-        };
-        if fam == Some(Family::Str) {
-            return self.scan_label_for_property_str_range(
-                rtxn,
-                label,
-                property,
-                min_val,
-                min_inclusive,
-                max_val,
-                max_inclusive,
-            );
-        }
-        let as_f64 = |v: &PropValue| match v {
-            PropValue::Int(i) => Some(*i as f64),
-            PropValue::Float(f) => Some(*f),
-            PropValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            PropValue::Str(_) => None,
-        };
-        let lo = min_val.as_ref().and_then(as_f64);
-        let hi = max_val.as_ref().and_then(as_f64);
+        let min = min_val.map(PropValue::into_json);
+        let max = max_val.map(PropValue::into_json);
         let mut result = Vec::new();
         for id in self.nodes_by_label_impl(rtxn, label)? {
             let Some(record) = self.get_node_impl(rtxn, id)? else {
                 continue;
             };
             let props: serde_json::Value = props::decode(&record.props)?;
-            // No bound at all asks for every node holding the property, as the
-            // index path answers it, whatever the value's kind.
-            if fam.is_none() {
-                if props.get(property).is_some_and(|v| !v.is_null()) {
-                    result.push(id);
-                }
-                continue;
-            }
-            let value = match (fam, props.get(property)) {
-                (Some(Family::Bool), Some(serde_json::Value::Bool(b))) => {
-                    if *b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                (Some(Family::Bool), _) => continue,
-                (_, Some(serde_json::Value::Number(n))) => match n.as_f64() {
-                    Some(f) => f,
-                    None => continue,
-                },
-                _ => continue,
-            };
-            let above_lo = match lo {
-                Some(l) if min_inclusive => value >= l,
-                Some(l) => value > l,
-                None => true,
-            };
-            let below_hi = match hi {
-                Some(h) if max_inclusive => value <= h,
-                Some(h) => value < h,
-                None => true,
-            };
-            if above_lo && below_hi {
+            if props.get(property).is_some_and(|value| {
+                property_in_range(
+                    value,
+                    min.as_ref(),
+                    min_inclusive,
+                    max.as_ref(),
+                    max_inclusive,
+                )
+            }) {
                 result.push(id);
             }
         }
@@ -1414,14 +1350,14 @@ impl Graph {
         prefix.extend_from_slice(&label_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
 
-        let min_encoded = min_val
-            .map(|v| v.into_json())
-            .as_ref()
-            .and_then(encode_property_value);
-        let max_encoded = max_val
-            .map(|v| v.into_json())
-            .as_ref()
-            .and_then(encode_property_value);
+        let min_value = min_val.map(PropValue::into_json);
+        let max_value = max_val.map(PropValue::into_json);
+        let min_encoded = min_value.as_ref().and_then(encode_property_value);
+        let max_encoded = max_value.as_ref().and_then(encode_property_value);
+        let verify_numeric_ties = [&min_value, &max_value]
+            .into_iter()
+            .flatten()
+            .any(numeric_index_may_collide);
 
         // A one-sided bound must not admit values of another type family that
         // merely sort past it in the tagged encoding (see `encoded_tag_family`).
@@ -1446,6 +1382,34 @@ impl Graph {
                     if val_bytes.is_empty() || encoded_tag_family(val_bytes[0]) != family {
                         continue;
                     }
+                }
+                // Rounded numeric keys can tie for distinct integers in existing databases.
+                if verify_numeric_ties
+                    && val_bytes.first() == Some(&3)
+                    && [&min_encoded, &max_encoded]
+                        .into_iter()
+                        .flatten()
+                        .any(|bound| val_bytes.get(..9) == bound.get(..9))
+                {
+                    let mut id_bytes = [0u8; 8];
+                    id_bytes.copy_from_slice(&key[key.len() - 8..]);
+                    let id = u64::from_be_bytes(id_bytes);
+                    let record = self
+                        .get_node_impl(rtxn, id)?
+                        .ok_or(Error::NodeNotFound(id))?;
+                    let props: serde_json::Value = props::decode(&record.props)?;
+                    if props.get(property).is_some_and(|value| {
+                        property_in_range(
+                            value,
+                            min_value.as_ref(),
+                            min_inclusive,
+                            max_value.as_ref(),
+                            max_inclusive,
+                        )
+                    }) {
+                        result.push(id);
+                    }
+                    continue;
                 }
                 if let Some(ref min_enc) = min_encoded {
                     if min_inclusive {
@@ -1587,6 +1551,18 @@ impl Graph {
                 // stored "a\0" is not returned for a lookup of "a" (see
                 // `exact_prop_index_id`).
                 if let Some(edge_id) = exact_prop_index_id(key, encoding) {
+                    if numeric_index_may_collide(&val) {
+                        let record = self
+                            .get_edge_impl(rtxn, edge_id)?
+                            .ok_or(Error::EdgeNotFound(edge_id))?;
+                        let props: serde_json::Value = props::decode(&record.props)?;
+                        if !props
+                            .get(property)
+                            .is_some_and(|stored| property_values_equal(stored, &val))
+                        {
+                            continue;
+                        }
+                    }
                     result.push(edge_id);
                 }
             }
@@ -1711,14 +1687,14 @@ impl Graph {
         prefix.extend_from_slice(&type_id.to_be_bytes());
         prefix.extend_from_slice(&prop_key_id.to_be_bytes());
 
-        let min_encoded = min_val
-            .map(|v| v.into_json())
-            .as_ref()
-            .and_then(encode_property_value);
-        let max_encoded = max_val
-            .map(|v| v.into_json())
-            .as_ref()
-            .and_then(encode_property_value);
+        let min_value = min_val.map(PropValue::into_json);
+        let max_value = max_val.map(PropValue::into_json);
+        let min_encoded = min_value.as_ref().and_then(encode_property_value);
+        let max_encoded = max_value.as_ref().and_then(encode_property_value);
+        let verify_numeric_ties = [&min_value, &max_value]
+            .into_iter()
+            .flatten()
+            .any(numeric_index_may_collide);
 
         // See `nodes_by_property_range_impl`: a one-sided bound must not admit
         // values of another type family that merely sort past it.
@@ -1743,6 +1719,28 @@ impl Graph {
                     if val_bytes.is_empty() || encoded_tag_family(val_bytes[0]) != family {
                         continue;
                     }
+                }
+                // Rounded numeric keys can tie for distinct integers in existing databases.
+                if verify_numeric_ties
+                    && val_bytes.first() == Some(&3)
+                    && [&min_encoded, &max_encoded]
+                        .into_iter()
+                        .flatten()
+                        .any(|bound| val_bytes.get(..9) == bound.get(..9))
+                {
+                    let mut id_bytes = [0u8; 8];
+                    id_bytes.copy_from_slice(&key[key.len() - 8..]);
+                    let id = u64::from_be_bytes(id_bytes);
+                    let record = self
+                        .get_edge_impl(rtxn, id)?
+                        .ok_or(Error::EdgeNotFound(id))?;
+                    let props: serde_json::Value = props::decode(&record.props)?;
+                    if props.get(property).is_some_and(|value| {
+                        property_in_range(value, min_value.as_ref(), true, max_value.as_ref(), true)
+                    }) {
+                        result.push(id);
+                    }
+                    continue;
                 }
                 if let Some(ref min_enc) = min_encoded {
                     if normalized_property_encoding(val_bytes)
@@ -2272,6 +2270,151 @@ mod tests {
                 .unwrap(),
             vec![b]
         );
+    }
+
+    #[test]
+    fn large_integer_scans_agree_with_indexes() {
+        let (_dir, g) = open_tmp();
+        let low = 9_007_199_254_740_992_i64;
+        let a = g.add_node("N", &json!({"x": low})).unwrap();
+        let b = g.add_node("N", &json!({"x": low + 1})).unwrap();
+        for indexed in [true, false] {
+            g.set_label_auto_index("N", indexed).unwrap();
+            assert_eq!(
+                g.nodes_by_property("N", "x", PropValue::Int(low)).unwrap(),
+                vec![a]
+            );
+            assert_eq!(
+                g.nodes_by_property("N", "x", PropValue::Float(low as f64))
+                    .unwrap(),
+                vec![a]
+            );
+            assert_eq!(
+                g.nodes_by_property_range("N", "x", Some(PropValue::Int(low)), false, None, false)
+                    .unwrap(),
+                vec![b]
+            );
+            assert_eq!(
+                g.nodes_by_property_range(
+                    "N",
+                    "x",
+                    None,
+                    false,
+                    Some(PropValue::Int(low + 1)),
+                    false
+                )
+                .unwrap(),
+                vec![a]
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_index_collisions_use_stored_values() {
+        let (_dir, g) = open_tmp();
+        g.create_edge_property_index("R", "x").unwrap();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for x in [i64::MAX as u64, 1_u64 << 63, (1_u64 << 63) + 1, u64::MAX] {
+            let node = g.add_node("N", &json!({"x": x})).unwrap();
+            nodes.push(node);
+            edges.push(g.add_edge(node, node, "R", &json!({"x": x})).unwrap());
+        }
+        for (bound, expected) in [
+            (PropValue::Int(i64::MAX), 0),
+            (PropValue::Float((1_u64 << 63) as f64), 1),
+        ] {
+            assert_eq!(
+                g.nodes_by_property("N", "x", bound.clone()).unwrap(),
+                vec![nodes[expected]]
+            );
+            assert_eq!(
+                g.edges_by_property("R", "x", bound.clone()).unwrap(),
+                vec![edges[expected]]
+            );
+            assert_eq!(
+                g.nodes_by_property_range(
+                    "N",
+                    "x",
+                    Some(bound.clone()),
+                    true,
+                    Some(bound.clone()),
+                    true
+                )
+                .unwrap(),
+                vec![nodes[expected]]
+            );
+            assert_eq!(
+                g.edges_by_property_range("R", "x", Some(bound.clone()), Some(bound))
+                    .unwrap(),
+                vec![edges[expected]]
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_unique_constraints_check_exact_values_on_writes_and_backfill() {
+        for backfill in [false, true] {
+            let (_dir, g) = open_tmp();
+            if !backfill {
+                g.create_node_unique_constraint("N", "x").unwrap();
+                g.create_edge_unique_constraint("R", "x").unwrap();
+            }
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            for x in [i64::MAX as u64, 1_u64 << 63, (1_u64 << 63) + 1, u64::MAX] {
+                let node = g.add_node("N", &json!({"x": x})).unwrap();
+                nodes.push(node);
+                edges.push(g.add_edge(node, node, "R", &json!({"x": x})).unwrap());
+            }
+            if backfill {
+                g.create_node_unique_constraint("N", "x").unwrap();
+                g.create_edge_unique_constraint("R", "x").unwrap();
+            }
+            for value in [
+                json!((1_u64 << 63) + 1),
+                json!((1_u64 << 63) as f64),
+                json!(u64::MAX),
+            ] {
+                let props = json!({"x": value});
+                assert!(matches!(
+                    g.add_node("N", &props),
+                    Err(Error::UniqueConstraintViolation(..))
+                ));
+                assert!(matches!(
+                    g.add_edge(nodes[0], nodes[0], "R", &props),
+                    Err(Error::UniqueConstraintViolation(..))
+                ));
+                assert!(matches!(
+                    g.update_node(nodes[0], &props),
+                    Err(Error::UniqueConstraintViolation(..))
+                ));
+                assert!(matches!(
+                    g.update_edge(edges[0], &props),
+                    Err(Error::UniqueConstraintViolation(..))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_unique_backfill_rejects_equal_integer_and_float() {
+        let (_dir, g) = open_tmp();
+        let a = g.add_node("N", &json!({"x": 1_u64 << 63})).unwrap();
+        let b = g
+            .add_node("N", &json!({"x": (1_u64 << 63) as f64}))
+            .unwrap();
+        g.add_edge(a, b, "R", &json!({"x": 1_u64 << 63})).unwrap();
+        g.add_edge(a, b, "R", &json!({"x": (1_u64 << 63) as f64}))
+            .unwrap();
+        assert!(matches!(
+            g.create_node_unique_constraint("N", "x"),
+            Err(Error::UniqueConstraintViolation(..))
+        ));
+        assert!(matches!(
+            g.create_edge_unique_constraint("R", "x"),
+            Err(Error::UniqueConstraintViolation(..))
+        ));
     }
 
     /// An integer-valued property must still be findable when queried with the

@@ -650,11 +650,11 @@ fn export_database_writes_the_schema_and_import_replays_it() {
     .unwrap();
     let schema = std::fs::read_to_string(export_dir.join("schema.cypher")).unwrap();
     for line in [
-        "CREATE CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE;",
-        "CREATE CONSTRAINT ON (n:User) ASSERT EXISTS(n.age);",
-        "CREATE INDEX FOR ()-[r:ROAD]-() ON (r.cost);",
-        "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT r.code IS UNIQUE;",
-        "CREATE CONSTRAINT ON ()-[r:ROAD]-() ASSERT EXISTS(r.len);",
+        "CREATE CONSTRAINT ON (n:`User`) ASSERT n.`email` IS UNIQUE;",
+        "CREATE CONSTRAINT ON (n:`User`) ASSERT EXISTS(n.`age`);",
+        "CREATE INDEX FOR ()-[r:`ROAD`]-() ON (r.`cost`);",
+        "CREATE CONSTRAINT ON ()-[r:`ROAD`]-() ASSERT r.`code` IS UNIQUE;",
+        "CREATE CONSTRAINT ON ()-[r:`ROAD`]-() ASSERT EXISTS(r.`len`);",
     ] {
         assert!(
             schema.contains(line),
@@ -663,7 +663,7 @@ fn export_database_writes_the_schema_and_import_replays_it() {
     }
     let index = std::fs::read_to_string(export_dir.join("index.cypher")).unwrap();
     assert!(
-        index.contains("CREATE INDEX FOR (n:User) ON (n.name);"),
+        index.contains("CREATE INDEX FOR (n:`User`) ON (n.`name`);"),
         "{index}"
     );
 

@@ -1,368 +1,100 @@
-# `issundb-core` Agent Guide
+# Core Agent Guidance
 
-This file covers crate-specific guidance for contributors working inside `crates/issundb-core`.
-Read the root `AGENTS.md` first; the rules there apply everywhere and are not repeated here.
+Read the root `AGENTS.md` first.
 
-## Storage Invariants
+## Storage and Write Invariants
 
-These invariants must hold after every successful write transaction:
-
-1. Adjacency consistency. For every edge `(src → dst)` stored in `out_adj` under key `src`, a matching `AdjEntry` must exist in `in_adj` under key
-   `dst`, and vice versa. Both entries encode the same `EdgeId`, `TypeId`, and the other node. Never write one side without writing the other in the
-   same `RwTxn`.
-
-2. ID monotonicity. `NodeId` and `EdgeId` are allocated by `alloc_node_id` and `alloc_edge_id` in `storage/ids.rs`, which increment a `u64`
-   counter stored in the `meta` sub-database. These counters must only ever increase. Never reset, reuse, or manually write a counter key outside
-   `ids.rs`.
-
-3. Label and type registry persistence. String-to-integer mappings for labels (`LabelId`) and edge types (`TypeId`) are stored as `"label:<name>"`
-   and `"type:<name>"` keys in `meta`. Every node or edge write must call `get_or_create_label` or `get_or_create_type` inside the same `RwTxn` that
-   writes the record. Do not cache integer IDs in memory between transactions and then use them in a later transaction without verifying they exist.
-
-4. Secondary index consistency. `label_idx` uses composite keys `(u32 BE, u64 BE)` with `Unit` values. Every `add_node` must insert its
-   `(LabelId, NodeId)` entry, and every `delete_node` must remove it. Edges have no such index: `edges_by_type` is one filtered pass over `edges`,
-   which iterates in ascending edge id, and the per-type counters in `meta` answer the counts.
-
-5. Property index consistency. Every `add_node` must write a `node_prop_idx` entry for each non-null scalar property in `props_json`. Every
-   `update_node` must delete old entries and write new ones for all changed scalar properties. Every `delete_node` must remove all `node_prop_idx`
-   entries for the deleted node. Failing to maintain this invariant causes `has_node_property_index` to return stale results and the Cypher optimizer
-   to emit incorrect `NodeIndexScan` plans.
-   Stored numeric keys preserve the sign of zero. Equality and uniqueness checks probe both zero keys, and range comparisons and constraint backfills
-   normalize them in memory. Keep the stored encoding unchanged so existing databases remain readable.
-
-## Storage Backends
-
-The engine is selected at compile time from the `lmdb` feature: on by default it is LMDB (`storage/lmdb.rs`), and with `--no-default-features` it is the
-in-memory backend (`storage/memory.rs`). The contract both owe is documented on `storage/mod.rs`; read that before changing either.
-
-- `heed` is named in exactly two places, both inside `storage/`. Everything else names the aliases `storage::{RoTxn, OwnedRoTxn, RwTxn}` and the twelve tables on
-  `Storage`. Do not reintroduce a `heed::` path elsewhere, and do not "simplify" the aliases away: they are what let a second backend exist at all.
-- `RoTxn` is the *parameter* alias and is deliberately the thread-local-agnostic flavor, because a write transaction derefs to it. That is what lets a write
-  path hand its `RwTxn` to a read helper, which ~90 signatures rely on. `OwnedRoTxn` is the owned flavor, used only by `ReadTxn`'s field.
-- Do not turn this into a trait. The tables hang off `Storage` which hangs off `Graph`, so a trait makes `Graph` generic over its backend and pushes that
-  parameter through every crate and the public API.
-- Three of the contract's guarantees are load-bearing rather than incidental LMDB behavior, and a new backend that misses one breaks callers silently: key
-  order is byte order (a `u64` key is stored big-endian so byte and numeric order agree, which the CSR build relies on when it treats `out_adj` as grouped by
-  ascending node id); duplicate order is byte order (which the CSR row-reordering pass relies on); and an uncommitted transaction leaves nothing behind.
-- A read transaction opened *while* a write transaction is live must work, and must see committed state. A write statement such as `MATCH ... CREATE` does
-  exactly that. A single reader-writer lock deadlocks on it, which is why the in-memory backend is copy-on-write.
-- Anything that is a file operation belongs on `Storage`, not on `Graph`: `copy_to_file` and `restore_from_file` are there so a backend without files refuses
-  both halves rather than one. `Graph::backup` and `Graph::restore` are thin delegations.
-- The in-memory backend does not persist, so a reopen sees an empty graph. Tests whose premise is reopen or backup are gated on `#[cfg(feature = "lmdb")]` and
-  say so; a new test in that class needs the same gate.
-
-## LMDB Lifetime Rules
-
-These apply to the LMDB backend, which is the default and the only persistent one.
-
-- Transactions must not escape the function that opened them. Open a `RoTxn` or `RwTxn`, use it, then commit (write) or drop (read) before returning.
-- `RoTxn` is cheap to create; open one per read call rather than storing it across calls.
-- `RwTxn` must be committed with `txn.commit()?` for changes to persist. A dropped `RwTxn` silently aborts; this is safe, but do not rely on implicit
-  abort as a rollback strategy. Explicit abort is `drop(txn)`.
-- Do not hold a `RwTxn` open while calling any method that might open another `RwTxn`; LMDB on Linux does not support nested write transactions.
-- Do not store transactions, cursors, or database handles with lifetimes tied to the transaction in `struct` fields or `Arc`.
-
-## Write-lock Contract
-
-All mutations to the graph go through the `Graph` API. Inside `Graph`:
-
-- A `parking_lot::ReentrantMutex<()>` serializes writes at the Rust level.
-- The LMDB environment enforces the same constraint at the storage level.
-- The `RwTxn` must be opened **inside** the lock scope, not before acquiring it. Pattern:
-
-  ```rust
-  let _guard = self._write_lock.lock();
-  let mut wtxn = self.storage.env.write_txn()?;
-  // ... mutations ...
-  wtxn.commit()?;
-  ```
-
-- Do not bypass either lock. Do not open a `RwTxn` directly from outside `Graph` methods.
-- Every fallible `WriteTxn` mutation runs through `mutate`. A failed write prevents later writes and makes `Graph::update` abort, even if the closure
-  catches the error and returns `Ok`. Read errors do not mark the transaction failed.
-- A `WriteTxn` batches its bookkeeping in `WriteBatchCache` and writes it just before the commit, in the same transaction. The next node and edge
-  ids are read from `meta` once and handed out from memory, and the per-label and per-type counts accumulate as deltas; both were a `meta` read and
-  write per record, a sixth of a bulk load. Every allocation and count change inside a `WriteTxn` must go through the cache (the `_inner` forms of
-  the node and edge writers take it): an allocation straight from `meta` beside the cached counter hands out an id twice, and a direct count
-  adjustment is clamped at zero against a stored count that has not absorbed the batch's additions. `WriteTxn::node_count_by_label` and
-  `edge_count_by_type` add the pending deltas, so a count read inside the transaction sees its own writes.
-- `WriteTxn::begin_bulk_load` (used by `COPY ... FROM` and `IMPORT DATABASE`) additionally buffers the adjacency entries and writes each direction
-  sorted by node id and duplicate order, in chunks of `ADJ_FLUSH_THRESHOLD` and at commit, through one cursor per direction
-  (`storage::put_sorted_duplicates`, one of the two backend-specific helpers beside the table aliases): LMDB descends from the root on every plain
-  `put`, and a positioned cursor whose next key lands on the same leaf skips that descent. One random `in_adj` put per edge dirtied a B-tree leaf per edge, and past a
-  few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
-  stored entries in store order, and a deletion flushes the buffer before it walks the stores.
-
-## Thread Count
-
-Every parallel consumer resolves its budget through `threads::resolve` (`threads.rs`). Precedence, first positive value winning: the programmatic
-override `Graph::set_thread_count` stored, then `ISSUNDB_NUM_THREADS`, then `OMP_NUM_THREADS`, then the machine's available parallelism, clamped to
-`MAX_THREADS`. There is no graph-size heuristic.
-
-Resolve through that one function rather than reading the environment here, or the same value comes to mean two things and two overlapping passes each
-claim the whole machine. `OMP_NUM_THREADS` is honored because setting it is how a caller (including this repository's coverage job) caps parallelism
-process-wide, and a caller that set it deliberately should not have to learn a second variable.
-
-There is no thread pool. Each pass resolves the budget when it starts and spawns scoped threads for its own duration, so `Graph::set_thread_count`
-stores a value, takes effect on the next pass, and cannot fail. Both stay serial below `MIN_PARALLEL_WORK`, so a unit test is deterministic.
-
-Pick the resolver by regime, not by habit. `Graph::kernel_threads` applies `MAX_SCAN_THREADS`, because a pass that streams the adjacency arrays (a
-counting kernel, or a PageRank iteration) saturates memory bandwidth long before compute and measurably slows down past that cap.
-`Graph::parallel_threads` is the same resolution without the cap, for the all-pairs passes (betweenness, harmonic centrality) whose cost is arithmetic
-per source out of per-worker buffers and which keep scaling. Capping those too silently discards most of the budget a caller asked for.
-
-PageRank and harmonic centrality write disjoint output chunks and so are split-invariant; betweenness sums per-worker partials, so a total's last bits
-depend on the worker count. Prefer the first shape where the algorithm allows it. A worker panic is a bug in the kernel, so it is resumed into the
-caller's thread with `resume_unwind` rather than converted to an `Error`: `Corrupt` would tell an operator to restore a backup over a code defect.
+- Write both adjacency directions and their record in the same transaction. Never publish one without the other.
+- Never reset or reuse node or edge IDs, or write allocation counters outside the allocation helpers. Do not reuse
+  registry IDs across transactions without verifying that the mappings committed.
+- Maintain label and property indexes in the record's transaction. Respect auto-index opt-outs while preserving
+  declared indexes and constraints. An omitted index entry must not make a stored value unqueryable.
+- Preserve persisted numeric key encoding, including signed zero. Equality and uniqueness must probe both zero keys.
+  Verify index candidates against stored values where unsigned keys can collide above `i64::MAX`; range ties and
+  constraint backfills must preserve exact numeric identity, including equal integer and float values.
+- Read `storage/mod.rs` before changing a backend. Preserve byte ordering of keys and duplicates, rollback, and
+  reads of committed state while a write is open. A single reader-writer lock would deadlock `MATCH ... CREATE`.
+- Keep `heed` paths inside `storage/` and retain the transaction aliases. The read parameter alias must accept a
+  dereferenced write transaction; do not replace it with the owned read-transaction flavor.
+- Keep file operations on `Storage` so a backend without files refuses both backup and restore.
+- Acquire the graph write lock before opening a write transaction. Never open another write transaction while one
+  is live. Do not retain borrowed transactions or cursors beyond their lifetime.
+- Route every fallible `WriteTxn` mutation through `mutate`. A caught mutation error must still poison the transaction
+  and prevent commit; a read error must not.
+- Use `WriteBatchCache` for all allocations and count changes inside `WriteTxn`. Mixing direct metadata writes with
+  cached counters can allocate an ID twice or clamp counts against stale values.
+- Bulk adjacency buffering must affect cost only: reads merge buffered entries in store order, and deletions flush
+  before walking the stores. Keep sorted cursor writes rather than random per-edge puts.
+- Advance vector generations only after commit. Aborts must leave them unchanged, including raw vector writes and
+  node deletions that remove embeddings.
 
 ## CSR Snapshot Vs. LMDB Adjacency
 
-`CsrSnapshot` (in `csr.rs`) is a read-only Compressed Sparse Row view of the adjacency: the outgoing arrays (destination, type, and edge id per
-entry) plus a transposed incoming view, and optionally a per-edge weight. It is swapped atomically via `arc_swap::ArcSwap`. It is the only in-memory
-adjacency structure, and every algorithm kernel in `graph/kernels/` reads it, bar `label_propagation`, which walks storage per node and is noted as the
-exception in that module's header.
-
-Every array is an `Array<T>` (`array.rs`): a `Vec` when the snapshot was built or patched in this process, a view into the memory-mapped cache file
-when it was loaded. Both dereference to `&[T]`, so a kernel indexes them the same way. `id_to_dense` is a `DenseIndex`: table-free when the node ids
-run without gaps (dense index = id minus the first id, which every bulk-loaded graph has), a hash map otherwise. A whole-label mask over two million
-nodes went from 60 ms of hash probes to 2 ms of subtractions, and a loaded contiguous snapshot owns no heap at all. The
-mapped pages are the page cache's: shared between processes, evictable under pressure, and resident only where a query has read. Mutation goes through
-`Array::with_mut`, which copies a mapped view onto the heap first; nothing ever writes through a mapping.
-
-It is built at the smallest size its consumers read, and the build is memory-shaped in ways that are easy to undo by accident:
-
-- The snapshot is built from `out_adj`, not from `edges`. The 20-byte `AdjEntry` holds the destination, the type id, and the edge id, which is every
-  field the arrays carry, and the entries arrive grouped by source in ascending key order. Reading them from `edges` instead means decoding one
-  `EdgeRecord` per edge, which also copies that edge's whole property blob.
-- Entries go straight into the flat arrays while the pass counts each row. Do not stage a `Vec` per node first: that is one allocation per node, held
-  alongside the finished arrays at the peak and then returned to the allocator as one hole per node, which `malloc_trim` cannot hand back. On a 1 M-node,
-  13.9 M-edge graph it left 3.3 GB resident for 620 MB of live arrays.
-- Each row is reordered by ascending edge id after the fill, because `DUPSORT` orders duplicates by the raw little-endian bytes of an `AdjEntry`, whose
-  first field is `edge_type`. That order is observable (an expansion emits its neighbors in it) and `load_weights` binary-searches it, so `csr.rs` has a
-  proptest pinning every array, incoming included, against the builder this replaced. The pass is a consequence of the stored layout: putting `edge_id`
-  first in big-endian, or installing a `DUPSORT` comparator, would make the iteration order right natively and delete it, but both change the format and
-  the order `out_neighbors` returns.
-- The incoming view carries its own type array (`in_edge_type`, a sequential read for a typed incoming scan) but no id array: `in_pos[k]` is the
-  outgoing position of the k-th incoming entry, so its id is `edge_id[in_pos[k]]`, four bytes per edge in place of eight, and only a rel-binding
-  expansion in the incoming direction reads it. Reading the type through `in_pos` was tried and doubled the two-hop count kernel's time (a random
-  read per incoming edge), and tallying typed in-degrees over the outgoing arrays was slower still (a scattered write per edge); do not remove
-  `in_edge_type`. `typed_neighbor_counts` does use the outgoing tally for a bulk incoming source set, where it was measured to win. The 32-bit
-  position caps a snapshot at `MAX_SNAPSHOT_EDGES`; a build past it is `Error::InvalidArgument`.
-- `edge_weight` is `Option` and only `build_weighted` fills it, at the cost of a second full scan of `edges`, since a weight lives in a property blob.
-  `shortest_path_dijkstra` is its only reader. Asking for it is sticky (`CsrCache::request_weights`), so a later unweighted refresh does not strip it out
-  from under an alternating workload; the cost is eight bytes per edge held once anything asks a weighted question. Requesting Dijkstra against a
-  snapshot without weights is `Error::InvalidArgument`, not `Error::Corrupt`: it is a caller mistake about gating, and `Corrupt` is what tells an operator
-  to restore a backup.
-- `Graph::with_weighted_snapshot` returns the snapshot it validated instead of letting the caller reload the pointer. A concurrent unweighted refresh can
-  replace it between a gate and a load, and the caller would then find no weights on a snapshot the gate had just vouched for.
-- The public entry points that gate themselves (`page_rank`, `shortest_path`, `bfs`, `expand_bulk`) must gate *before* reading, never from inside a
-  live guard. An entry point that recursed into its own gate while holding one deadlocked the calling thread against itself as soon as the gate reached a
-  rebuild, since the maintenance mutex is not reentrant. Any new public entry point here follows the same order: gate, then read.
-
-Rebuilds happen on demand through the freshness gates below; the background rebuild after `REBUILD_THRESHOLD` writes is a compaction safety net, not
-the freshness path.
-
-A refresh patches before it rebuilds. Every committing mutator hands `commit_and_publish` a `CsrChange` (the added nodes and edges with their
-endpoints and type, an `edges_updated` flag, or `full` for any removal), which `CsrCache::record_change` tags with the write generation *before* the
-advance and appends to a pending list; the tag is what lets an install drop the batches a snapshot built at generation `B` already contains (every
-batch tagged below `B`) and keep the rest. `Graph::refresh_snapshot_locked` then applies the pending additions to the installed snapshot through
-`CsrSnapshot::with_additions`, one pass over the arrays plus the transpose and no adjacency read, and builds from storage only when a batch is `full`,
-when an edge update meets a snapshot carrying weights, when the installed snapshot is the unbuilt placeholder, or when the pending edges outgrew
-`INCREMENTAL_MAX_EDGES`. Three rules keep this sound, and the proptest `incremental_refresh_matches_a_full_build_over_a_random_history` pins all of
-them against a build from storage after every refresh: a change is recorded before the generation advances, so a refresh that reads the counter finds
-every batch the counter accounts for; a patched row keeps ascending edge-id order (appended ids are normally larger, and a row is re-sorted otherwise);
-and a node id that does not sort after every existing one declines the patch, because dense indices are the rank of ascending node ids.
-
-A full build first tries the on-disk cache file (`cache_file.rs`, `lmdb` feature only): `build_snapshot` maps the file (`memmap2`) and points the
-arrays into it, after verifying the checksum over the whole file in one sequential pass, when the file carries this database's identity (`Storage::db_id`, a random 128-bit value persisted in `meta` on first open) and its persisted commit generation
-(`storage/ids.rs`, `commit_gen`, advanced inside every mutating transaction through `commit_and_publish`) matches storage, and falls through to the scan
-on any mismatch, truncation, oversized length claim, or checksum failure. The identity is what refuses a file another database left behind at a
-coincidentally matching generation, which a restore into a directory with leftover cache files would otherwise serve; `restore_from_file` also removes
-such leftovers. The arrays sit at 8-byte-aligned offsets in a fixed order, which is what makes the mapping possible; a host that is not 64-bit
-little-endian refuses the file and builds from storage. A save writes a temporary file and renames it into place, so a live mapping keeps serving the
-inode it opened. On Windows that rename is refused while a mapping is alive, so `publish_cache_file` moves the old file aside first and deletes it
-when the mapping allows; `Graph::open` removes any `.cache.old-*` file a previous process could not. The refresh's
-`with_additions` copies a mapped snapshot's rows into owned arrays, the copy-on-write the `Array` type exists for. `Graph::rebuild_csr` is the only
-save site, chosen because every bulk load ends there, and it always builds from storage rather than
-loading the file it is about to overwrite, or a wrong file could never be repaired; the gate's per-write refreshes never write a file. The generation is
-captured before a build or save, so a write landing mid-pass leaves the result conservatively stale rather than falsely fresh. The cache file changes
-where a full build's bytes come from and nothing about the within-process freshness rules.
-
-- Always write to LMDB first. The CSR snapshot is derived from LMDB, not the other way around.
-- Use LMDB adjacency databases (`out_adj`, `in_adj`) for correctness-critical reads: single-node neighbor lookups, existence checks, and anything
-  inside a transaction.
-- The point adjacency lookups (`out_neighbors`, `in_neighbors`, `all_neighbors`, and `node_has_relationships`) all read `out_adj` and `in_adj`
-  directly through the transaction and never consult the snapshot, so they always reflect committed and in-transaction writes. A write-time
-  consistency check (such as the DELETE connected-node guard) depends on that: keep any new point lookup on storage truth rather than routing it
-  through the snapshot for speed.
-- Use the CSR snapshot as the hot read path for graph algorithms (BFS, DFS, PageRank, SCC). Callers do not have to refresh it by hand: every algorithm
-  entry point goes through `Graph::with_snapshot`, or `Graph::with_weighted_snapshot` for the one that reads per-edge weights. A new algorithm picks
-  between those two by what it reads, and reading `edge_weight` behind the unweighted one is an error rather than a wrong answer. `Graph::rebuild_csr`
-  does not *ask* for weights (though it keeps loading them once something else has), so it is not a way to warm them before a burst of weighted calls;
-  Dijkstra's own gate does that on first use.
-- A kernel that needs a per-edge property the snapshot does not carry reads it from storage per call. That is deliberate for the weight-*property*
-  algorithms (`spanning_forest`, `shortest_path_top_k`, `maximum_flow`), which take the property name as an argument: there is no fixed key to preload.
-
-- The snapshot is published through `arc-swap` and paired with two counters, `write_gen` and `snapshot_gen`, whose comparison is the freshness
-  condition every consumer tests. The write path also fills a `GraphDelta` buffer, whose only consumers are the property column caches; the CSR itself
-  is rebuilt rather than patched.
+- Storage is authoritative. Point adjacency reads and reads inside a write transaction must use storage truth,
+  including pending writes, rather than a committed snapshot.
+- Keep `Graph::open` lazy. Small point workloads must not pay for a full snapshot or property-column build.
+- Gate snapshot freshness before acquiring a live snapshot guard. Reentering the maintenance gate while holding
+  a guard can deadlock. Use the weighted gate when reading weights, and use the snapshot that gate validated
+  rather than reloading a pointer a concurrent refresh could replace.
+- Keep weight requests sticky across refreshes to avoid alternating weighted and unweighted rebuilds.
+  Do not make every bulk load request weights. Property-name-based algorithms must read their requested property.
+- Build directly into flat arrays from adjacency, not decoded edge records or a temporary vector per node. The
+  latter retains property blobs or leaves allocator fragmentation proportional to the graph size.
+- Preserve ascending edge-ID order in every row, including incremental patches. Raw duplicate order differs from
+  that observable expansion order, and weight loading binary-searches it. Changing stored ordering requires a
+  format-compatibility decision.
+- Retain the incoming type array: indirect type reads through outgoing positions have regressed typed traversal.
+- Record incremental changes before advancing the generation. An install must discard only changes already in its
+  captured generation. Decline incremental patches when node ordering would invalidate dense indices.
+- Mutate mapped arrays only through `Array::with_mut`; never write through a mapped cache file.
+- Accept cache files only after identity, generation, bounds, and checksum validation. Restore must not reuse
+  another database's cache at a coincidentally matching generation.
+- Capture generations before building or saving so a concurrent write leaves results conservatively stale.
+- Keep cache saves explicit: `rebuild_csr` and the property-column materializers are the save sites. Query-time
+  refreshes must not write cache files. Explicit CSR rebuilds must read storage so a bad file can be repaired.
+- Preserve safe replacement of live mappings, including Windows rename restrictions and old-file cleanup.
 
 ## In-memory Property Columns
 
-`columns.rs` holds a typed, in-memory columnar view of scalar properties used as the hot read path for property gathers and aggregations.
-It is derived from LMDB, like the CSR snapshot, and follows the same write-LMDB-first rule.
-
-- `PropColumns<S: ColumnSource>` stores one typed column per property (Int, Float, Bool, dict-encoded Str, or a JSON fallback) over a dense
-  `id -> index` mapping, the same `DenseIndex` the CSR snapshot uses: a subtraction when the entity ids run without gaps, a hash map otherwise.
-  Replacing the hash map cut the per-row cost of every bulk gather and comparison mask; the four-hop chains in the benchmark dropped from 185 ms to
-  27 ms at 2M persons with this and the cached label bitmap together. `NodeSource` and `EdgeSource` implement `ColumnSource`, so nodes and edges share one generic store; `Graph` holds
-  `prop_columns: ColumnsCache<NodeSource>` and `edge_columns: ColumnsCache<EdgeSource>`.
-- A column is `Int`, `Float`, `Bool`, a dictionary-encoded `Str`, or the exact-semantics `Json` fallback, and single-property reads come through
-  `Graph::node_prop_json`. The typed variants are plain arrays behind `Array<T>` (see the CSR section): `Nullable<T>` is a presence bitmap beside a
-  value array (nine bits of tag per eight bytes of value, where `Vec<Option<i64>>` doubled the slot), `Bool` stores a byte per slot, and `StrDict` is an
-  offsets array over one byte run with its interning map derived on the first intern rather than stored. Only `Json` lives on the heap unconditionally.
-- The whole-graph build streams: `ColumnSource::for_each` hands each entity's decoded properties to the per-property `ColumnBuilder`s and drops them
-  before the next entity is read. Do not reintroduce a collect-everything scan (the old `scan_all`); holding every entity's `Value` until the end
-  peaked at three times the finished columns' size on a million-node graph. A builder picks the tightest kind from the first non-null value and
-  degrades to `Json` at the first value of another kind, exactly as a patch does. A property with no non-null value finishes as an all-null `Int` column
-  with a zero presence bitmap and an integer array that can be mapped on load. This reduces heap usage and avoids decoding `n` msgpack nils on load,
-  but increases the cache payload from about one byte per slot to eight bytes per slot plus the bitmap. The per-property statistics (`PropStats`: bounds, an equi-depth histogram, and the most common values) are computed lazily
-  beside the columns and invalidated by the same post-commit patch.
-- `ColumnsCache<S>` builds lazily from one full `scan_all`, but a read does not necessarily cause that build, and the distinction is deliberate. A
-  request for at most `SMALL_GATHER_MAX` entities is served as point reads straight from storage while the columns are absent
-  (`should_serve_directly`), because building every column is one full scan and that is the wrong answer to a request for a handful of entities. Those
-  direct reads amortize a build after `DIRECT_READ_BUILD_THRESHOLD` of them, so a row pipeline reading one property per row still ends up on the
-  columns. The advisory statistics readers never build (see `with_existing_mut` below), and a grouped read follows the same size test by building an
-  ephemeral column set over just the requested entities. Size the test on the request, not on the method: the Cypher vectorized executor gathers even a
-  one-row projection through the bulk API. Nothing builds the shared columns as a side effect of a small workload, so a caller that wants them warm
-  calls `Graph::materialize_property_columns`.
-- Once built, the columns are kept fresh by post-commit deltas: writers call `record_touched`/`record_force_full`, and `with_fresh` patches the touched
-  ids (one read transaction for the whole batch, via `fetch_many`) or rebuilds on `force_full` before serving a read. A failed absorb queues a full
-  rebuild rather than dropping the taken delta, so a transient storage error cannot leave the columns quietly serving pre-write values.
-- Read the columns through `with_fresh`, or through `with_existing_mut` when the caller is advisory. `with_existing_mut` never builds an absent cache;
-  it answers `None` instead. That is what keeps the optimizer's selectivity estimates and the zone-map prune from making the first query that mentions
-  any property pay a full node scan, so do not "fix" an advisory reader by switching it to `with_fresh`.
-- Prefer the bulk forms (`Graph::node_props_json_table`, `node_prop_json_column`, `node_prop_group_codes`, and the `edge_*` equivalents): they refresh
-  once and gather a whole column, versus `node_prop_json`, which refreshes per call. The Cypher vectorized aggregate path depends on the bulk forms
-  (see `issundb-cypher/AGENTS.md`).
-- This store is a cache, never the source of truth. Any new write path that changes a scalar property must record a delta against both `prop_columns`
-  and `edge_columns` as applicable, the same way it updates `node_prop_idx`.
-- A full build tries the columns cache file first (`cache_file.rs`, `lmdb` feature only), generation-checked the same way the CSR cache file is;
-  `Graph::materialize_property_columns` is the node columns' save site, `Graph::materialize_edge_property_columns` the edge columns', and a repeat at
-  an unchanged generation skips the rewrite. The file is a directory of columns followed by their arrays at 8-byte-aligned offsets, and a load maps
-  it: each typed column becomes a view of the file, so a property no query reads never becomes resident, and the first patch copies just the touched
-  columns onto the heap. That is the per-property laziness; there is deliberately no per-property build from storage, because one streaming scan
-  builds every column for the price of decoding each record once, where a scan per property would decode them once per property. A `Json` column
-  is decoded onto the heap at load. The file skips the string interning maps and the statistics, both derivable. The checksum is verified over the
-  whole file before anything is served, one sequential read.
-- `Graph::nodes_prop_cmp_mask` is the typed predicate evaluation over these columns: a comparison filter's per-row outcome computed against the native
-  column storage, declining (`Ok(None)`) on a small cold request or a `Json` column so the caller falls back to boxed comparison. Its semantics are
-  pinned by `typed_cmp_mask_follows_cypher_scalar_semantics`; change that test only together with the boxed comparison it mirrors.
+- Stream decoded records into column builders and discard each record before reading the next. Do not collect
+  every property map before building columns.
+- Size cold-read decisions on the request, not the API method: even bulk APIs can receive one entity.
+- Advisory readers must not build absent columns. Use `with_existing_mut`; use `with_fresh` for authoritative reads.
+- Record post-commit deltas for every affected node or edge column cache. If absorbing a delta fails, queue a full
+  rebuild rather than losing the delta and serving stale values.
+- Prefer bulk gathers over repeated per-property refreshes. Do not introduce a separate storage scan per property.
+- Keep typed comparison masks consistent with boxed Cypher comparisons, including nulls and mixed numeric types.
 
 ## Schema Statistics
 
-`graph/stats.rs` holds the schema-level edge statistics: the `(label, type)` fan-out marginals and the realized `(src_label, type, dst_label)` triples.
-Like the property columns it is a derived cache, and it follows the same rule that an advisory reader never builds one. It differs in one way that
-matters, so keep the two readers apart when changing it.
+- Build from label indexes and adjacency rather than decoding records with property blobs.
+- Advisory fan-out estimates may use stale statistics only within the per-type growth bound. Do not replace that
+  bound with global edge growth, remove it, or require strict freshness after every write.
+- Build outside the statistics lock, then install the result. Holding the lock during the scan blocks query planning.
+- Read the generation after taking the lock; reading it first can accept a stale negative after a concurrent commit.
+- `schema_has_edge` is authoritative because a negative drops rows. Never use stale statistics for it. Keep its
+  budgeted storage fallback, charge every storage operation, and return unknown when the budget is exhausted.
+- Never prove emptiness from counters. Counters may choose a probe direction; the label index must prove emptiness.
+- Key memoized probe verdicts by write generation so a write cannot leave a false negative cached.
 
-- The build is one pass over `label_idx` and one over `out_adj`. Do not "simplify" it back to scanning `nodes` and `edges`: decoding a `NodeRecord` to
-  read its `labels` also copies that node's whole property blob, and decoding an `EdgeRecord` to read its endpoints copies the edge's, which is most of
-  the cost and none of the answer. Reading the labels from `label_idx` also means the statistics describe exactly the population a label scan enumerates.
-- The generation check gates use, not refresh. A table from an earlier generation is ignored, never served: `schema_has_edge` reads the same table, and a
-  stale negative there would deny a triple a committed write just realized.
-- `estimate_expand_fanout` and `estimate_expand_fanout_to` are advisory, and read through `with_possibly_stale_fanout`. Nothing builds the table for them;
-  `Graph::materialize_edge_statistics` is the deliberate warm-up: `issundb-cli` calls it synchronously on open, and `issundb-rest` and `issundb-mcp` spawn
-  it in the background so readiness is not gated on a scan that costs seconds (3.4 s on a 1 M-node, 13.9 M-edge graph). They accept a table the generation
-  has moved past, bounded per relationship type by `STALE_FANOUT_GROWTH_FACTOR` against that type's live `stats:t:` counter. Do not "fix" this to a strict generation check: that is what made a warmed process lose its statistics on the first write and never
-  recover them. Do not weaken the bound to a global edge count either, which cannot see a skewed ingest that quadruples one type inside a graph that grew
-  by a third, and do not remove it, or a process that warms at startup and then ingests plans forever against the startup snapshot.
-- The whole build runs outside the `edge_fanout` lock, with the result installed at the end. Holding the lock across it was tolerable while this was an
-  internal lazy helper; it is not now that consumers call it on a live graph, where it would block every concurrent query's planning for the scan's
-  duration.
-- Both accessors read `csr_cache.current_gen()` *after* taking the lock. Reading it first leaves a window in which a write commits before the lock is
-  acquired, so a table predating that write matches the captured value and passes as current: for `schema_has_edge` that is a stale negative, and the
-  optimizer drops rows on it.
-- `schema_has_edge` is not advisory, because the optimizer prunes rows on a negative. It must keep answering with no table, so it falls back to a bounded
-  probe of `label_idx` plus the adjacency (`SCHEMA_PROBE_BUDGET`), settling on the first matching edge and reporting `None` when the budget runs out.
-  Do not make this reader table-only: that leaves `prune_unsatisfiable` dormant on every graph nobody has materialized, which is a silent loss of the
-  pass rather than a visible failure. Its one test is `type_inference_prunes_unsatisfiable_pattern` in `issundb-cypher`.
-- Charge the probe budget for every storage operation, including visiting a node before its adjacency is read. Charging only adjacency entries left the
-  walk unbounded for exactly the population most likely to be chosen: a small label whose nodes have no edges in the direction under test, where every
-  node took the "no adjacency" path for free.
-- Probe verdicts are memoized in `schema_probes` against the write generation. The pass that asks runs on every execution because there is no plan cache,
-  so without the memo an unsatisfiable hop re-walks the graph once per query rather than once per generation. The memo is keyed on the generation, never
-  cleared lazily, so it cannot answer for a graph a write has changed.
-- A `Some(false)` from either path must never rest on a stored counter. The probe reads the per-label counter only to choose which endpoint population to
-  walk, where a wrong answer costs at most an undecided verdict; emptiness is asked of `label_idx` directly.
+## Algorithms and Parallelism
 
-## Algorithm Kernels
+- Document the duplicate rule for new kernels and retain tests for parallel edges. Do not substitute row lengths
+  for distinct degrees or reachability for per-edge influence.
+- Do not recurse over unbounded graph depth: stack overflow aborts the process. Keep search stacks on the heap.
+  The bounded `dfs(hops: u8)` exception must become iterative if that bound is widened.
+- Preserve deterministic traversal, frontier, and accumulation order. A result cap must not select arbitrary nodes.
+- Keep Louvain serial: local moving is order-dependent, so splitting it across workers changes the partition.
+- Resolve thread budgets through `threads::resolve`, never by reading environment variables independently.
+  Use `kernel_threads` for bandwidth-bound scans and `parallel_threads` for all-pairs work; the latter must not
+  silently discard the caller's requested budget through the scan cap.
+- Prefer disjoint output partitions when possible. Betweenness partial sums can vary in their last bits with
+  worker count; do not promise bitwise equality across counts.
+- Resume worker panics rather than reporting storage corruption, which could prompt an unnecessary restore.
 
-The kernels live in `graph/kernels/`, split by family: `traversal.rs` (BFS and bulk expansion), `analytics.rs` (PageRank, components, the centralities,
-label propagation), `paths.rs` (the shortest-path family and the simple-path searches), and `flow.rs` (spanning forest and maximum flow). Each is plain
-Rust over the CSR arrays.
+## Instrumentation and Tests
 
-Three rules matter when adding or changing one, because each has been silently violated before:
-
-- Duplicate handling is per algorithm, and the conventions disagree. `degree_centrality` counts *distinct* neighbors, so parallel edges collapse;
-  `page_rank` spreads a source's rank over its *edges*, so parallel edges each carry mass; `betweenness_centrality` counts distinct pairs, because two
-  parallel edges are one shortest path and crediting both inflates `sigma` and every dependency downstream of it; Dijkstra takes the cheapest. These were
-  the `First`, `Plus`, `break`-after-first, and `Min` duplicate rules of the matrix formulation that preceded this code, and each has a test pinning it.
-  A row length is not a degree and a row scan is not a transition probability: decide which convention a new kernel wants and say so in a comment. Note
-  that the NetworkX oracle cannot catch a mistake here, because its corpus is simple graphs.
-- No depth-first kernel may recurse over graph structure. A DFS's depth is the length of the current path, so recursion needs one call frame per node on a chain,
-  and a Rust stack overflow aborts the *process* rather than returning an `Error`: a single query would take down a server. `detect_cycle`,
-  `strongly_connected_components`, `all_paths`, `longest_path`, and the `all_shortest_paths` backward walk all carry their search stack on the heap for this
-  reason, with the node plus a cursor into its row where the recursion kept a loop counter. `dfs` is the one exception and only because `hops: u8` bounds it at
-  255 frames; widening that argument means converting it too. `deep_graph_tests` pins all of this by running the kernels on a thread with a 1 MiB stack
-  (`wasm32-unknown-unknown`'s default) over a 20 000-node chain, and a regression there aborts the test binary rather than failing politely.
-- Where a result's sequence is observable, fix it deliberately. A traversal reports reached nodes in ascending dense (so ascending node id) order, and
-  each frontier is sorted before it is consumed, so a `max_nodes` cap keeps the lowest-numbered nodes rather than whichever the traversal happened to reach
-  first. Brandes accumulates over sources and predecessors in that same order, which is what makes a betweenness total reproducible run to run rather
-  than merely close.
-
-## The 11 Sub-databases
-
-All eleven are opened once by `Storage::open`, in `storage/lmdb.rs` for the default backend, and mirrored field for field by `storage/memory.rs`. The layout
-below is the LMDB one; a second backend has to reproduce its key encoding and ordering, not just its field names:
-
-| Name            | Key                                                        | Value                                 | Notes                                                                                                                                                                                                  |
-|-----------------|------------------------------------------------------------|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `nodes`         | `u64 BE` (NodeId)                                          | msgpack `NodeRecord`                  | Primary node store.                                                                                                                                                                                    |
-| `edges`         | `u64 BE` (EdgeId)                                          | msgpack `EdgeRecord`                  | Primary edge store.                                                                                                                                                                                    |
-| `out_adj`       | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Outgoing adjacency; one duplicate per edge.                                                                                                                                                            |
-| `in_adj`        | `u64 BE` (NodeId)                                          | `AdjEntry` (20 B, DUPSORT + DUPFIXED) | Incoming adjacency; mirror of `out_adj`.                                                                                                                                                               |
-| `label_idx`     | `(u32 BE, u64 BE)` = 12 B composite                        | `Unit`                                | Secondary index: `(LabelId, NodeId)`.                                                                                                                                                                  |
-| `node_prop_idx` | `(LabelId, PropKeyId, encoded_val, NodeId)` variable       | `Unit`                                | Property range index for nodes. Auto-populated for every scalar property on every `add_node` and `update_node` (semi-columnar auto-index); also used for user-created unique and required constraints. |
-| `edge_prop_idx` | `(TypeId, PropKeyId, encoded_val, EdgeId)` variable        | `Unit`                                | Property range index for edges.                                                                                                                                                                        |
-| `fts_postings`  | `(LabelId, PropKeyId, term)` variable (DUPSORT + DUPFIXED) | 12 B `(NodeId BE, frequency BE)`      | Inverted posting lists for full-text search.                                                                                                                                                           |
-| `fts_docs`      | 16 B `(LabelId, PropKeyId, NodeId BE)`                     | 4 B `u32 BE` doc length               | Per-document term count for BM25.                                                                                                                                                                      |
-| `vectors`       | `u64 BE` (NodeId)                                          | raw `f32` bytes (little-endian)       | Persistent vector embeddings.                                                                                                                                                                          |
-| `meta`          | `Str` key                                                  | `Bytes` value                         | Counters (the persisted commit generation `commit_gen` included), label/type registries, FTS stats.                                                                                                                                                            |
-
-`DUPSORT + DUPFIXED` databases require all duplicate values under a key to be the same byte length; `AdjEntry` is 20 bytes and FTS posting values are
-12 bytes.
-
-## `deepsize::DeepSizeOf` Usage
-
-`deepsize` is used to track heap allocation of record types for memory instrumentation:
-
-- Derive `#[derive(DeepSizeOf)]` for types that own heap-allocated fields (`Vec<u8>`, `String`, nested structs with allocations). Examples:
-  `NodeRecord`, `EdgeRecord`.
-- Implement manually for `#[repr(C, packed)]` or zero-copy structs that contain no heap allocations. Override `deep_size_of_children` to return
-  `0`. Example: `AdjEntry`.
-- Do not derive `DeepSizeOf` for types that are never measured; implement it only where the size is actually read at runtime.
-
-## Testing Rules
-
-- Every test that touches LMDB must open a fresh `tempfile::TempDir`:
-
-  ```rust
-  let dir = TempDir::new().unwrap();
-  let graph = Graph::open(dir.path(), 1).unwrap();
-  ```
-
-- Never share a `Graph`, `Storage`, or `TempDir` across tests. Each test is responsible for its own directory.
-- Use `proptest` for ID uniqueness and adjacency round-trip invariants. A good property: for any sequence of `add_node` / `add_edge` / `delete_node`
-  calls, every surviving edge must have matching entries in both `out_adj` and `in_adj`.
-- Prefer targeted, single-assertion tests over broad snapshot comparisons. Test one round-trip, one count, or one invariant per test function.
-- After any mutation test, verify the inverse: delete what was added and check that the record and all index entries are gone.
+- Derive `DeepSizeOf` only for measured heap-owning types. Packed, heap-free records need a manual zero-child-size
+  implementation rather than a derive that takes unaligned references.
+- Use property tests for ID uniqueness and adjacency round trips. Mutation tests should verify deletion removes
+  the record and its index entries as well as checking insertion.

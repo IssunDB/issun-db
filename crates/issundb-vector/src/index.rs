@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::{VectorBackend, new_backend};
 use parking_lot::RwLock;
@@ -310,7 +311,9 @@ pub trait VectorGraphExt {
     /// the in-memory index is updated first and the bytes are then stored in their
     /// own transaction, so it cannot join or roll back with a caller's
     /// `Graph::update`. A caller that needs the bytes to land atomically with graph
-    /// writes stages them through `WriteTxn::put_vector_bytes`.
+    /// writes stages them through `WriteTxn::put_vector_bytes`. After a staged
+    /// vector write commits, the next search or vector mutation rebuilds the
+    /// index from stored embeddings in O(n) time.
     fn upsert_vector(&self, n: NodeId, v: &[f32]) -> Result<(), VectorError>;
 
     /// Remove the embedding for `n` from the index and from persistent storage.
@@ -355,43 +358,20 @@ pub trait VectorGraphExt {
 }
 
 /// Key type used to store the persistent HNSW cache in `Graph::extensions`.
-struct VectorIndexCache(VectorIndex);
+struct VectorIndexCache(VectorIndex, AtomicU64);
 
-/// Serializes every vector mutation's two steps: the in-memory index update
-/// and the storage write. Without it, two calls for one node can interleave so
-/// the index ranks by one embedding while storage holds the other (poisoning
-/// the rescore pass and the next cold-start rebuild), or a remove racing an
-/// upsert leaves an index entry whose stored bytes are gone. It is its own
-/// extension rather than a field on `VectorIndexCache`, because
-/// `reindex_vector_index` swaps the cache and a lock inside the swapped value
-/// could not cover the swap itself.
-///
-/// This mutex is acquired first in the lock ordering, before the index's internal
-/// `RwLock` and before any storage transaction, and never while the
-/// `extensions` mutex is held (`get_or_init_extension_with` runs its
-/// initializer without that lock). Read paths take the index `RwLock` without
-/// this mutex, which is safe because no path acquires them in the reverse
-/// order.
-struct VectorMutationLock {
-    lock: parking_lot::Mutex<()>,
+#[cfg(test)]
+#[derive(Default)]
+struct VectorTestHooks {
     /// Test-only pause point fired in `upsert_vector` between the in-memory
     /// index update and the storage write, so a test can hold one call open
     /// inside that window deterministically. Instance-scoped through the graph
     /// extension rather than global, so parallel tests cannot interfere.
-    #[cfg(test)]
     upsert_pause: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
-impl VectorMutationLock {
-    fn new() -> Self {
-        Self {
-            lock: parking_lot::Mutex::new(()),
-            #[cfg(test)]
-            upsert_pause: parking_lot::Mutex::new(None),
-        }
-    }
-
-    #[cfg(test)]
+#[cfg(test)]
+impl VectorTestHooks {
     fn pause_after_index_update(&self) {
         // Take the hook before running it, so it fires once and never runs
         // while the slot's mutex is held: a hook that parks would otherwise
@@ -403,10 +383,10 @@ impl VectorMutationLock {
     }
 }
 
-/// Return this graph's vector mutation lock, creating it on first use.
-fn mutation_lock(graph: &Graph) -> Arc<VectorMutationLock> {
+#[cfg(test)]
+fn test_hooks(graph: &Graph) -> Arc<VectorTestHooks> {
     let lock: Result<_, std::convert::Infallible> =
-        graph.get_or_init_extension_with(|| Ok(Arc::new(VectorMutationLock::new())));
+        graph.get_or_init_extension_with(|| Ok(Arc::new(VectorTestHooks::default())));
     match lock {
         Ok(lock) => lock,
         Err(never) => match never {},
@@ -415,54 +395,58 @@ fn mutation_lock(graph: &Graph) -> Arc<VectorMutationLock> {
 
 impl VectorGraphExt for Graph {
     fn configure_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
-        // The mutation lock keeps the emptiness check, the persisted config,
+        // The graph write lock keeps the emptiness check, the persisted config,
         // and the cache swap one step: an upsert cannot land between them and
         // be indexed under the configuration this call replaces.
-        let lock = mutation_lock(self);
-        let _guard = lock.lock.lock();
-        // Compare against the EFFECTIVE config: when nothing is persisted the
-        // active configuration is the lazily built default, so re-applying that
-        // default (or any already-active config) is a no-op, as documented, not
-        // an `AlreadyConfigured` error.
-        let effective = load_config(self)?.unwrap_or_default();
-        if effective == opts {
-            return Ok(());
-        }
-        // The HNSW graph is built per-metric. Changing the metric or
-        // quantization once embeddings exist would silently reinterpret them on
-        // the next cold-start rebuild, so refuse it while vectors are present.
-        if !self.vector_bytes()?.is_empty() {
-            return Err(VectorError::AlreadyConfigured {
-                existing: format!("{effective:?}"),
-                requested: format!("{opts:?}"),
-            });
-        }
-        self.put_vector_config(&encode_config(opts))?;
-        // Replace any lazily built default cache so later upserts use the new
-        // configuration. Safe because no vectors exist yet.
-        self.set_extension(Arc::new(VectorIndexCache(VectorIndex::new_with_options(
-            opts,
-        ))));
-        Ok(())
+        self.with_vector_write_lock(|| {
+            // Compare against the EFFECTIVE config: when nothing is persisted the
+            // active configuration is the lazily built default, so re-applying that
+            // default (or any already-active config) is a no-op, as documented, not
+            // an `AlreadyConfigured` error.
+            let effective = load_config(self)?.unwrap_or_default();
+            if effective == opts {
+                return Ok(());
+            }
+            // The HNSW graph is built per-metric. Changing the metric or
+            // quantization once embeddings exist would silently reinterpret them on
+            // the next cold-start rebuild, so refuse it while vectors are present.
+            if !self.vector_bytes()?.is_empty() {
+                return Err(VectorError::AlreadyConfigured {
+                    existing: format!("{effective:?}"),
+                    requested: format!("{opts:?}"),
+                });
+            }
+            self.put_vector_config(&encode_config(opts))?;
+            // Replace any lazily built default cache so later upserts use the new
+            // configuration. Safe because no vectors exist yet.
+            self.set_extension(Arc::new(VectorIndexCache(
+                VectorIndex::new_with_options(opts),
+                AtomicU64::new(self.vector_generation()),
+            )));
+            Ok(())
+        })
     }
 
     fn reindex_vector_index(&self, opts: VectorIndexOptions) -> Result<(), VectorError> {
-        // The mutation lock serializes the rebuild against concurrent upserts
+        // The graph write lock serializes the rebuild against concurrent upserts
         // and removes, so the snapshot read from storage cannot miss a
         // mutation that landed between the scan and the cache swap.
-        let lock = mutation_lock(self);
-        let _guard = lock.lock.lock();
-        // Rebuild the index from the stored raw embeddings FIRST, then persist
-        // the new configuration and swap the cache. Building before persisting
-        // means a mid-rebuild failure leaves BOTH the previous cache and the
-        // previous persisted config in place, so the next cold-start rebuild does
-        // not silently reinterpret embeddings under a metric the failed operation
-        // never finished applying. `build_index` takes `opts` explicitly, so it
-        // does not depend on the persisted config.
-        let rebuilt = build_index(self, opts)?;
-        self.put_vector_config(&encode_config(opts))?;
-        self.set_extension(Arc::new(VectorIndexCache(rebuilt)));
-        Ok(())
+        self.with_vector_write_lock(|| {
+            // Rebuild the index from the stored raw embeddings FIRST, then persist
+            // the new configuration and swap the cache. Building before persisting
+            // means a mid-rebuild failure leaves BOTH the previous cache and the
+            // previous persisted config in place, so the next cold-start rebuild does
+            // not silently reinterpret embeddings under a metric the failed operation
+            // never finished applying. `build_index` takes `opts` explicitly, so it
+            // does not depend on the persisted config.
+            let rebuilt = build_index(self, opts)?;
+            self.put_vector_config(&encode_config(opts))?;
+            self.set_extension(Arc::new(VectorIndexCache(
+                rebuilt,
+                AtomicU64::new(self.vector_generation()),
+            )));
+            Ok(())
+        })
     }
 
     #[instrument(skip(self, v), fields(node = %n, dims = v.len()))]
@@ -475,45 +459,45 @@ impl VectorGraphExt for Graph {
         // The cost is one key probe per upsert, inside a call that already opens a write
         // transaction and rebuilds an index entry. `remove_vector` stays permissive on purpose, so
         // a database that already holds such a vector can still be cleaned up.
-        // The mutation lock spans the index update and the storage write, so a
+        // The graph write lock spans the index update and the storage write, so a
         // concurrent call for the same node cannot leave the index ranking by
         // one embedding while storage holds another.
-        let lock = mutation_lock(self);
-        let _guard = lock.lock.lock();
-        if !self.node_exists(n)? {
-            return Err(VectorError::NodeNotFound(n));
-        }
-        let bytes = encode_vector(v)?;
-        // Validate against (and update) the in-memory index BEFORE persisting to
-        // LMDB. `upsert` rejects empty or dimension-mismatched embeddings, so
-        // doing it first guarantees a rejected vector never reaches durable
-        // storage. If it did, the cold-start rebuild on the next `Graph::open`
-        // would hit the mismatch and fail to build the index, bricking every
-        // subsequent search. The reverse failure (index updated, LMDB write
-        // fails) only drops an in-memory entry that the next reopen rebuilds
-        // consistently, so it is the safe ordering.
-        let arc = get_or_init_cache(self)?;
-        arc.0.upsert(n, v)?;
-        #[cfg(test)]
-        lock.pause_after_index_update();
-        self.put_vector_bytes(n, &bytes)?;
-        Ok(())
+        self.with_vector_write_lock(|| {
+            if !self.node_exists(n)? {
+                return Err(VectorError::NodeNotFound(n));
+            }
+            let bytes = encode_vector(v)?;
+            // Validate against (and update) the in-memory index BEFORE persisting to
+            // LMDB. `upsert` rejects empty or dimension-mismatched embeddings, so
+            // doing it first guarantees a rejected vector never reaches durable
+            // storage. If it did, the cold-start rebuild on the next `Graph::open`
+            // would hit the mismatch and fail to build the index, bricking every
+            // subsequent search. The reverse failure (index updated, LMDB write
+            // fails) only drops an in-memory entry that the next reopen rebuilds
+            // consistently, so it is the safe ordering.
+            let arc = get_or_init_cache(self)?;
+            arc.1.store(u64::MAX, Ordering::Release);
+            arc.0.upsert(n, v)?;
+            #[cfg(test)]
+            test_hooks(self).pause_after_index_update();
+            self.put_vector_bytes(n, &bytes)?;
+            arc.1.store(self.vector_generation(), Ordering::Release);
+            Ok(())
+        })
     }
 
     fn remove_vector(&self, n: NodeId) -> Result<(), VectorError> {
-        // Same invariant as `upsert_vector`: the mutation lock spans the index
-        // update and the storage write. The cache is initialized rather than
-        // merely peeked at, or a cold-start build racing this call could
-        // re-admit the entry from bytes this call is about to delete. Index
-        // first, then storage: a failure between the two loses an in-memory
-        // entry the next reopen rebuilds, where the reverse would leave a live
-        // index entry whose stored bytes are gone.
-        let lock = mutation_lock(self);
-        let _guard = lock.lock.lock();
-        let arc = get_or_init_cache(self)?;
-        arc.0.remove(n)?;
-        self.delete_vector_bytes(n)?;
-        Ok(())
+        // Same invariant as `upsert_vector`: the graph write lock spans the index
+        // update and the storage write. Invalidate first so a storage failure
+        // forces the next search to rebuild from committed bytes.
+        self.with_vector_write_lock(|| {
+            let arc = get_or_init_cache(self)?;
+            arc.1.store(u64::MAX, Ordering::Release);
+            arc.0.remove(n)?;
+            self.delete_vector_bytes(n)?;
+            arc.1.store(self.vector_generation(), Ordering::Release);
+            Ok(())
+        })
     }
 
     #[instrument(skip(self, q), fields(k = %k, dims = q.len()))]
@@ -617,9 +601,8 @@ impl VectorGraphExt for Graph {
             // expanding, returning live matches only.
             results
         } else {
-            // Unfiltered: a node deleted through the core graph API stays in the
-            // in-memory HNSW index, because core deletion cannot reach this
-            // vector-crate extension. Over-fetch and drop those "ghost" hits,
+            // A concurrent deletion can land after this search acquired its cache.
+            // Over-fetch and drop those "ghost" hits,
             // growing the fetch window until `fetch_k` live hits remain (or the
             // index is exhausted). A fixed `fetch_k` would truncate the result
             // below `opts.k` when enough top-ranked nodes had been deleted.
@@ -743,16 +726,27 @@ pub(crate) fn exact_distance(q: &[f32], v: &[f32], metric: VectorMetric) -> f32 
     }
 }
 
-/// Return the cached `VectorIndexCache` for this Graph, building it from LMDB
-/// if it has not been initialised yet.
+/// Return the vector cache for this graph, refreshing it after raw vector writes.
 fn get_or_init_cache(graph: &Graph) -> Result<Arc<VectorIndexCache>, VectorError> {
-    // Cold start: load all vectors from LMDB into a fresh HNSW index, built with
-    // the graph's persisted metric and quantization (default Cosine and Float32
-    // when never configured). The initializer runs without the extensions lock
-    // held, so reading from storage here cannot deadlock against it.
-    graph.get_or_init_extension_with(|| {
+    if let Some(cache) = graph.get_extension::<VectorIndexCache>() {
+        if cache.1.load(Ordering::Acquire) == graph.vector_generation() {
+            return Ok(cache);
+        }
+    }
+    graph.with_vector_write_lock(|| {
+        let generation = graph.vector_generation();
+        if let Some(cache) = graph.get_extension::<VectorIndexCache>() {
+            if cache.1.load(Ordering::Acquire) == generation {
+                return Ok(cache);
+            }
+        }
         let opts = load_config(graph)?.unwrap_or_default();
-        Ok(Arc::new(VectorIndexCache(build_index(graph, opts)?)))
+        let cache = Arc::new(VectorIndexCache(
+            build_index(graph, opts)?,
+            AtomicU64::new(generation),
+        ));
+        graph.set_extension(cache.clone());
+        Ok(cache)
     })
 }
 
@@ -837,6 +831,162 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let graph = Graph::open(dir.path(), 1).unwrap();
         (dir, graph)
+    }
+
+    #[test]
+    fn transactional_vector_writes_refresh_a_warm_index() {
+        let (_dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0, 0.0]).unwrap();
+        graph
+            .update(|txn| txn.put_vector_bytes(b, &encode_vector(&[0.0, 1.0]).unwrap()))
+            .unwrap();
+        assert_eq!(graph.vector_search(&[0.0, 1.0], 1).unwrap()[0].node, b);
+
+        graph
+            .update(|txn| txn.put_vector_bytes(a, &encode_vector(&[0.0, 1.0]).unwrap()))
+            .unwrap();
+        for hit in graph.vector_search(&[1.0, 0.0], 2).unwrap() {
+            assert!((hit.distance - 1.0).abs() < 1e-5);
+        }
+        graph.update(|txn| txn.delete_vector_bytes(a)).unwrap();
+        let hits = graph.vector_search(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, b);
+        graph.update(|txn| txn.delete_vector_bytes(b)).unwrap();
+        assert!(matches!(
+            graph.vector_search(&[1.0, 0.0], 1),
+            Err(VectorError::EmptyIndex)
+        ));
+    }
+
+    #[test]
+    fn deleting_the_last_embedded_node_refreshes_the_index() {
+        for transactional in [false, true] {
+            let (_dir, graph) = open_tmp();
+            let a = graph.add_node("N", &json!({})).unwrap();
+            let b = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[1.0, 0.0]).unwrap();
+            let generation = graph.vector_generation();
+            if transactional {
+                graph.update(|txn| txn.delete_node(a)).unwrap();
+            } else {
+                graph.delete_node(a).unwrap();
+            }
+            assert!(graph.vector_generation() > generation);
+            assert!(matches!(
+                graph.vector_search(&[1.0, 0.0], 1),
+                Err(VectorError::EmptyIndex)
+            ));
+            graph.upsert_vector(b, &[1.0, 0.0, 0.0]).unwrap();
+            assert_eq!(graph.vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].node, b);
+        }
+    }
+
+    #[test]
+    fn aborted_node_deletion_keeps_the_vector_cache() {
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(node, &[1.0, 0.0]).unwrap();
+        let cache = get_or_init_cache(&graph).unwrap();
+        let generation = graph.vector_generation();
+        let result: Result<(), _> = graph.update(|txn| {
+            txn.delete_node(node)?;
+            Err(issundb_core::Error::InvalidArgument("abort".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(graph.vector_generation(), generation);
+        assert!(Arc::ptr_eq(&cache, &get_or_init_cache(&graph).unwrap()));
+        assert_eq!(graph.vector_search(&[1.0, 0.0], 1).unwrap()[0].node, node);
+        assert_eq!(graph.node_vector(node).unwrap(), Some(vec![1.0, 0.0]));
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn node_deletion_and_new_vector_dimensions_survive_reopen() {
+        let (dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0, 0.0]).unwrap();
+        graph.delete_node(a).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(b, &[1.0, 0.0, 0.0]).unwrap();
+        drop(graph);
+        let reopened = Graph::open(dir.path(), 1).unwrap();
+        assert_eq!(
+            reopened.vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].node,
+            b
+        );
+        assert!(matches!(
+            reopened.upsert_vector(b, &[1.0, 0.0]),
+            Err(VectorError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn aborted_vector_writes_keep_the_warm_index_and_stored_bytes() {
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(node, &[1.0, 0.0]).unwrap();
+        let cache = get_or_init_cache(&graph).unwrap();
+        let generation = graph.vector_generation();
+        let result: Result<(), _> = graph.update(|txn| {
+            txn.put_vector_bytes(node, &encode_vector(&[0.0, 1.0]).unwrap())?;
+            Err(issundb_core::Error::InvalidArgument("abort".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(graph.vector_generation(), generation);
+        assert_eq!(graph.node_vector(node).unwrap(), Some(vec![1.0, 0.0]));
+        assert!(Arc::ptr_eq(&cache, &get_or_init_cache(&graph).unwrap()));
+        assert!(graph.vector_search(&[1.0, 0.0], 1).unwrap()[0].distance < 1e-5);
+    }
+
+    #[test]
+    fn ordinary_upserts_keep_the_cache_and_direct_vector_writes_refresh_it() {
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(node, &[1.0, 0.0]).unwrap();
+        let cache = get_or_init_cache(&graph).unwrap();
+        graph.upsert_vector(node, &[0.0, 1.0]).unwrap();
+        assert!(Arc::ptr_eq(&cache, &get_or_init_cache(&graph).unwrap()));
+        graph
+            .put_vector_bytes(node, &encode_vector(&[1.0, 0.0]).unwrap())
+            .unwrap();
+        assert!(graph.vector_search(&[1.0, 0.0], 1).unwrap()[0].distance < 1e-5);
+        graph.delete_vector_bytes(node).unwrap();
+        assert!(matches!(
+            graph.vector_search(&[1.0, 0.0], 1),
+            Err(VectorError::EmptyIndex)
+        ));
+    }
+
+    #[test]
+    fn transactional_vector_write_racing_an_upsert_keeps_storage_and_search_in_sync() {
+        use std::sync::mpsc;
+
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        let lock = test_hooks(&graph);
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *lock.upsert_pause.lock() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| graph.upsert_vector(node, &[1.0, 0.0]).unwrap());
+            parked_rx.recv().unwrap();
+            let second = scope.spawn(|| {
+                graph
+                    .update(|txn| txn.put_vector_bytes(node, &encode_vector(&[0.0, 1.0]).unwrap()))
+                    .unwrap()
+            });
+            release_tx.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert_eq!(graph.node_vector(node).unwrap(), Some(vec![0.0, 1.0]));
+        assert!(graph.vector_search(&[0.0, 1.0], 1).unwrap()[0].distance < 1e-5);
     }
 
     /// An embedding for an id no node holds is refused.
@@ -1466,7 +1616,7 @@ mod tests {
     /// demand. The test-only pause hook parks the first upsert inside the
     /// window between its index update and its storage write; a second upsert
     /// for the same node then runs to completion before the first is released.
-    /// The mutation lock makes the second call wait, so index and storage
+    /// The graph write lock makes the second call wait, so index and storage
     /// agree; without it the first call finishes by writing v1 to storage
     /// while the index already ranks by v2.
     #[test]
@@ -1477,7 +1627,7 @@ mod tests {
         let n = graph.add_node("N", &json!({})).unwrap();
         let graph = Arc::new(graph);
 
-        let lock = mutation_lock(&graph);
+        let lock = test_hooks(&graph);
         let (parked_tx, parked_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         *lock.upsert_pause.lock() = Some(Box::new(move || {
@@ -1500,10 +1650,10 @@ mod tests {
             let g = Arc::clone(&graph);
             std::thread::spawn(move || g.upsert_vector(n, &v2).unwrap())
         };
-        // Ordering help only: give T2 time to reach the mutation lock (or, in
+        // Ordering help only: give T2 time to reach the graph write lock (or, in
         // the broken shape, to complete inside the window) before releasing
         // T1. T1 must be released from here, because under the fixed code it
-        // parks while holding the mutation lock and T2 blocks on it, so
+        // parks while holding the graph write lock and T2 blocks on it, so
         // waiting on T2 first would deadlock.
         std::thread::sleep(std::time::Duration::from_millis(100));
         release_tx.send(()).unwrap();

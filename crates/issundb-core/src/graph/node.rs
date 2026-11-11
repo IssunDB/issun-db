@@ -181,8 +181,8 @@ impl Graph {
 
     /// Enforce a unique constraint for one node property value, excluding the
     /// node itself. An index-encodable value is checked via `node_prop_idx`
-    /// (exact encoded-value match, so `30` and `30.0` conflict, matching the
-    /// range and equality lookups); a value too long to index falls back to a
+    /// with stored-value verification for rounded numeric collisions, so `30`
+    /// and `30.0` conflict but distinct integers do not. A value too long to index falls back to a
     /// label scan comparing stored values, so the constraint holds for long
     /// strings that never reach the index.
     #[allow(clippy::too_many_arguments)]
@@ -216,6 +216,18 @@ impl Graph {
                     // string encoding lets "a" prefix-match a stored "a\0").
                     if let Some(found_node_id) = exact_prop_index_id(key, encoding) {
                         if found_node_id != node_id {
+                            if numeric_index_may_collide(val) {
+                                let record = self
+                                    .get_node_impl(wtxn, found_node_id)?
+                                    .ok_or(Error::NodeNotFound(found_node_id))?;
+                                let props: serde_json::Value = props::decode(&record.props)?;
+                                if !props
+                                    .get(prop_name)
+                                    .is_some_and(|stored| property_values_equal(stored, val))
+                                {
+                                    continue;
+                                }
+                            }
                             return Err(violation());
                         }
                     }
@@ -513,8 +525,12 @@ impl Graph {
         self.debug_assert_not_in_write_txn();
         let _guard = self._write_lock.lock();
         let mut wtxn = self.storage.env.write_txn()?;
+        let had_vector = self.storage.vectors.get(&wtxn, &id)?.is_some();
         self.delete_node_impl(&mut wtxn, id)?;
         self.commit_and_publish(wtxn, 1, crate::csr::CsrChange::full())?;
+        if had_vector {
+            self.advance_vector_generation();
+        }
         // A node deletion cascades to every incident edge, so the edge property
         // columns must rebuild; without this a deleted edge stays readable
         // through `edge_prop_json` and the vectorized executor's edge reads.
