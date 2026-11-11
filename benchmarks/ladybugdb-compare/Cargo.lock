@@ -665,9 +665,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heed"
-version = "0.22.1"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad82d6598ccf1dac15c8b758a1bd282b755b6776be600429176757190a1b0202"
+checksum = "6a56c94661ddfb51aa9cdfbf102cfcc340aa69267f95ebccc4af08d7c530d393"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -974,9 +974,9 @@ dependencies = [
 
 [[package]]
 name = "lbug"
-version = "0.20.2"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8f69721f12ba475a701175989c1827da3517d12fe6152fdfc002d7e6c2daa11"
+checksum = "cf04a487886d15eab0fa90253622e0ebdc584864477ac98708ad7fc85553bcb9"
 dependencies = [
  "cmake",
  "cxx",
