@@ -603,10 +603,8 @@ mod tests {
     /// distance per stored vector, so the answer depends on the dimension count and the
     /// latency budget, not on anything here.
     ///
-    /// The recorded figures live in `crates/issundb-vector/AGENTS.md` beside the other
-    /// rebuild costs, because nothing runs this by default and numbers kept here would rot
-    /// silently. Read the query figure against the dimension count it uses, four, where a
-    /// real embedding is 384 or 768.
+    /// Interpret timings against the dimension count used here, four; real embeddings
+    /// commonly have 384 or 768 dimensions.
     #[test]
     #[ignore = "measurement: prints exact-backend rebuild and query timings"]
     fn exact_backend_cost() {
