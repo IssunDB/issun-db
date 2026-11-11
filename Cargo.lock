@@ -1415,7 +1415,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "issundb"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "criterion",
  "gherkin",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cli"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-core"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-cypher"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-examples"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "issundb",
  "rmp-serde",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-mcp"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "anyhow",
  "axum",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-py"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "issundb",
  "pyo3",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-rest"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "anyhow",
  "axum",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-retrieval"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-text"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "arrow-array",
  "criterion",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-vector"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "arrow-array",
  "criterion",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "issundb-wasm"
-version = "0.1.0-alpha.31"
+version = "0.1.0-alpha.32"
 dependencies = [
  "issundb",
  "rmp-serde",
