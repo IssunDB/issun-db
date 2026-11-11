@@ -49,7 +49,7 @@
               pkgs.cmake
               pkgs.gnumake
               pkgs.graphviz
-              pkgs.python3
+              pkgs.python313
               pkgs.uv
               pkgs.maturin
               pkgs.openssl
