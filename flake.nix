@@ -84,6 +84,9 @@
           ladybugdb = pkgs.mkShell {
             inputsFrom = [ (mkDevShell benchmarkToolchain) ];
             packages = [ pkgs.cmake pkgs.curl ];
+            # lbug's OpenSSL fallback adds host library paths that can override Nix's libc.
+            OPENSSL_DIR = "${pkgs.lib.getLib pkgs.openssl}";
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc pkgs.openssl ];
           };
           # Release artifacts must link against the runner's libraries, not /nix/store.
           release = pkgs.mkShellNoCC {
