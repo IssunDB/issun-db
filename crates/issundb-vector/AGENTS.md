@@ -49,7 +49,7 @@ administrative operation; the graph write lock serializes it against concurrent 
 Vector mutations hold `Graph::with_vector_write_lock` across the index update and storage write. Acquire this graph write lock before the index's
 internal `RwLock`, and never while holding the `extensions` mutex. Configuration changes and rebuilds use the same lock.
 
-Core advances `Graph::vector_generation` after raw vector writes commit, including writes staged through `WriteTxn`. The cached vector index carries
+Core advances `Graph::vector_generation` after raw vector writes or embedded-node deletions commit, including changes staged through `WriteTxn`. The cached vector index carries
 that generation. A stale cache rebuilds from committed bytes under the graph write lock; a current search reads without that lock. Normal upserts and
 removes update the cached generation after their storage write, so they keep the existing index rather than rebuilding it. Invalidate the cached
 generation before mutating the index, so a failed storage write cannot leave the modified index serving later searches.

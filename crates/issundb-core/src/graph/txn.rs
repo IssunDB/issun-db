@@ -435,6 +435,7 @@ impl<'a> WriteTxn<'a> {
             // in first.
             txn.cache
                 .flush_adjacency(&txn.graph.storage, &mut txn.wtxn)?;
+            txn.vectors_changed |= txn.graph.storage.vectors.get(&txn.wtxn, &id)?.is_some();
             txn.graph
                 .delete_node_inner(&mut txn.wtxn, Some(&mut txn.cache), id)?;
             txn.mutations_count += 1;

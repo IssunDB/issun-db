@@ -29,6 +29,9 @@ These invariants must hold after every successful write transaction:
    to emit incorrect `NodeIndexScan` plans.
    Stored numeric keys preserve the sign of zero. Equality and uniqueness checks probe both zero keys, and range comparisons and constraint backfills
    normalize them in memory. Keep the stored encoding unchanged so existing databases remain readable.
+   Numeric scan comparisons preserve signed and unsigned integer precision. Persisted numeric keys can collide for unsigned values above `i64::MAX`;
+   equality and uniqueness probes verify those candidates against stored properties, and numeric range ties do the same. Constraint backfills use exact
+   value identities rather than stored index keys, including equality between an integer and a float representing the same value.
 
 ## Storage Backends
 
@@ -93,7 +96,7 @@ All mutations to the graph go through the `Graph` API. Inside `Graph`:
   few million edges the per-edge cost had grown 3.4x. The mode changes cost only: the neighbor reads on `WriteTxn` merge the buffer into the
   stored entries in store order, and a deletion flushes the buffer before it walks the stores.
 
-Raw vector writes advance `Graph::vector_generation` only after commit.
+Raw vector writes and node deletions that remove embeddings advance `Graph::vector_generation` only after commit.
 `WriteTxn` records a vector-change flag and publishes it after its commit; an abort leaves the generation alone. The vector crate
 uses `with_vector_write_lock` to coordinate cache rebuilds and index mutations with these writes, without exposing storage internals.
 

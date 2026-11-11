@@ -601,9 +601,8 @@ impl VectorGraphExt for Graph {
             // expanding, returning live matches only.
             results
         } else {
-            // Unfiltered: a node deleted through the core graph API stays in the
-            // in-memory HNSW index, because core deletion cannot reach this
-            // vector-crate extension. Over-fetch and drop those "ghost" hits,
+            // A concurrent deletion can land after this search acquired its cache.
+            // Over-fetch and drop those "ghost" hits,
             // growing the fetch window until `fetch_k` live hits remain (or the
             // index is exhausted). A fixed `fetch_k` would truncate the result
             // below `opts.k` when enough top-ranked nodes had been deleted.
@@ -859,6 +858,68 @@ mod tests {
         assert!(matches!(
             graph.vector_search(&[1.0, 0.0], 1),
             Err(VectorError::EmptyIndex)
+        ));
+    }
+
+    #[test]
+    fn deleting_the_last_embedded_node_refreshes_the_index() {
+        for transactional in [false, true] {
+            let (_dir, graph) = open_tmp();
+            let a = graph.add_node("N", &json!({})).unwrap();
+            let b = graph.add_node("N", &json!({})).unwrap();
+            graph.upsert_vector(a, &[1.0, 0.0]).unwrap();
+            let generation = graph.vector_generation();
+            if transactional {
+                graph.update(|txn| txn.delete_node(a)).unwrap();
+            } else {
+                graph.delete_node(a).unwrap();
+            }
+            assert!(graph.vector_generation() > generation);
+            assert!(matches!(
+                graph.vector_search(&[1.0, 0.0], 1),
+                Err(VectorError::EmptyIndex)
+            ));
+            graph.upsert_vector(b, &[1.0, 0.0, 0.0]).unwrap();
+            assert_eq!(graph.vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].node, b);
+        }
+    }
+
+    #[test]
+    fn aborted_node_deletion_keeps_the_vector_cache() {
+        let (_dir, graph) = open_tmp();
+        let node = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(node, &[1.0, 0.0]).unwrap();
+        let cache = get_or_init_cache(&graph).unwrap();
+        let generation = graph.vector_generation();
+        let result: Result<(), _> = graph.update(|txn| {
+            txn.delete_node(node)?;
+            Err(issundb_core::Error::InvalidArgument("abort".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(graph.vector_generation(), generation);
+        assert!(Arc::ptr_eq(&cache, &get_or_init_cache(&graph).unwrap()));
+        assert_eq!(graph.vector_search(&[1.0, 0.0], 1).unwrap()[0].node, node);
+        assert_eq!(graph.node_vector(node).unwrap(), Some(vec![1.0, 0.0]));
+    }
+
+    #[cfg(feature = "lmdb")]
+    #[test]
+    fn node_deletion_and_new_vector_dimensions_survive_reopen() {
+        let (dir, graph) = open_tmp();
+        let a = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(a, &[1.0, 0.0]).unwrap();
+        graph.delete_node(a).unwrap();
+        let b = graph.add_node("N", &json!({})).unwrap();
+        graph.upsert_vector(b, &[1.0, 0.0, 0.0]).unwrap();
+        drop(graph);
+        let reopened = Graph::open(dir.path(), 1).unwrap();
+        assert_eq!(
+            reopened.vector_search(&[1.0, 0.0, 0.0], 1).unwrap()[0].node,
+            b
+        );
+        assert!(matches!(
+            reopened.upsert_vector(b, &[1.0, 0.0]),
+            Err(VectorError::DimensionMismatch { .. })
         ));
     }
 
