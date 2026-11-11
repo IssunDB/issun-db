@@ -50,6 +50,9 @@ jobs:
       - name: Check GitHub workflows
         run: actionlint
 
+      - name: Check Nix environments
+        run: nix flake check --no-build --all-systems --no-update-lock-file
+
       - name: Check formatting
         run: make format-check
 

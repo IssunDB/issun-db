@@ -81,7 +81,10 @@
           });
           stable = mkDevShell rustToolchain;
           msrv = mkDevShell msrv;
-          ladybugdb = mkDevShell benchmarkToolchain;
+          ladybugdb = pkgs.mkShell {
+            inputsFrom = [ (mkDevShell benchmarkToolchain) ];
+            packages = [ pkgs.cmake pkgs.curl ];
+          };
           # Release artifacts must link against the runner's libraries, not /nix/store.
           release = pkgs.mkShellNoCC {
             packages = [ rustToolchain pkgs.pkg-config pkgs.maturin ];
