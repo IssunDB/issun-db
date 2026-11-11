@@ -219,7 +219,7 @@ publish-py: wheel-py-manylinux ## Publish the issundb-py wheel to PyPI (needs PY
 	   exit 1; \
 	fi
 	@echo "Found wheel file: $(WHEEL_FILE)"
-	@twine upload -u __token__ -p $(PYPI_TOKEN) $(WHEEL_FILE)
+	@UV_PUBLISH_TOKEN="$(PYPI_TOKEN)" $(PY_MNGR) publish "$(WHEEL_FILE)"
 
 .PHONY: repl
 repl: ## Launch the REPL (pass REPL_PATH=<dir> to set the database path; defaults to ./issundb-data)

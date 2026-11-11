@@ -148,11 +148,11 @@ jobs:
       - name: Verify wheels
         run: |
           ls -la wheels/
-          nix develop --no-update-lock-file -c uv run --frozen --extra dev twine check wheels/*
+          nix develop --no-update-lock-file -c uv publish --dry-run wheels/*
 
       - name: Publish wheels to PyPI
         env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          nix develop --no-update-lock-file -c uv run --frozen --extra dev twine upload wheels/* -u __token__ -p "$TWINE_PASSWORD"
+          nix develop --no-update-lock-file -c uv publish wheels/*
         if: success()
