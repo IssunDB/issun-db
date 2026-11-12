@@ -89,13 +89,6 @@
             OPENSSL_DIR = "${pkgs.lib.getLib pkgs.openssl}";
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc pkgs.openssl ];
           };
-          # Release artifacts must link against the runner's libraries, not /nix/store.
-          release = pkgs.mkShellNoCC {
-            packages = [ rustToolchain pkgs.pkg-config pkgs.maturin ];
-            CC = "/usr/bin/cc";
-            CXX = "/usr/bin/c++";
-            "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] pkgs.stdenv.hostPlatform.rust.rustcTarget)}_LINKER" = "/usr/bin/cc";
-          };
         });
 
       formatter = forAllSystems (pkgs: pkgs.nixpkgs-fmt);
